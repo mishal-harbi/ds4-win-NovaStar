@@ -3,7 +3,11 @@
 #include <stdbool.h>
 #include <stdio.h>
 #include <string.h>
+#if defined(_WIN32)
+#include "ds4_win32.h"
+#else
 #include <unistd.h>
+#endif
 
 typedef struct {
     const char *off;
@@ -165,6 +169,8 @@ static void print_model_runtime(FILE *fp, const help_colors *c,
     opt(fp, c, "--ssd-streaming", "Metal/CUDA/ROCm: opt in to SSD-backed model streaming instead of full residency.");
     opt(fp, c, "--ssd-streaming-cold", "SSD streaming: skip default popularity-based expert-cache preload.");
     opt(fp, c, "--ssd-streaming-cache-experts N|NGB", "SSD streaming: routed expert cache as expert count or GiB, e.g. 32GB. Metal/ROCm default: 80% working set minus non-routed weights; CUDA default: backend fixed cache.");
+    opt(fp, c, "--ram-streaming-cache-experts N|NGB", "CUDA SSD streaming: cache routed experts in host RAM as expert count or GiB, e.g. 80GB, before falling back to SSD reads.");
+    opt(fp, c, "--ram-streaming-cache-preload", "CUDA SSD streaming: preload the RAM expert cache at startup instead of warming it on first use.");
     opt(fp, c, "--ssd-streaming-preload-experts N", "SSD streaming: upfront popularity preload count. Default: auto hot seed capped at 4096; use --ssd-streaming-cold to skip.");
     opt(fp, c, "--simulate-used-memory NGB", "Diagnostic: lock N GiB before model load to simulate a smaller-memory machine.");
     opt(fp, c, "--prefill-chunk N", "Metal graph prefill chunk size. Default: auto (PRO long prompts use 8192; others use 4096).");

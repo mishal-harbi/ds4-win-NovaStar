@@ -1,0 +1,42 @@
+name: Windows CPU Build
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+      - master
+      - windows
+      - windows-cuda
+  workflow_dispatch:
+
+jobs:
+  windows-cpu-build:
+    name: Build ds4.exe and ds4-bench.exe on Windows
+    runs-on: windows-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Build native Windows CPU target
+        shell: pwsh
+        run: powershell -ExecutionPolicy Bypass -File .\windows_build.ps1 -Target cpu
+
+      - name: Verify command help
+        shell: pwsh
+        run: |
+          .\ds4.exe --help
+          .\ds4-bench.exe --help
+
+      - name: Verify observable benchmark wrapper dry run
+        shell: pwsh
+        run: powershell -ExecutionPolicy Bypass -File .\tests\windows_observable_benchmark_tests.ps1
+
+      - name: Check for unexpected tracked-file modifications
+        shell: pwsh
+        run: |
+          $diff = git status --short --untracked-files=no
+          if ($diff) {
+            Write-Error "Build modified tracked files:`n$diff"
+          }

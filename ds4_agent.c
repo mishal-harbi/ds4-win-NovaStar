@@ -7,14 +7,22 @@
 
 #include <errno.h>
 #include <ctype.h>
-#include <dirent.h>
-#include <fnmatch.h>
 #include <fcntl.h>
 #include <limits.h>
 #include <math.h>
+#if defined(_WIN32)
+#include "ds4_win32.h"
+#else
+#include <dirent.h>
+#include <fnmatch.h>
 #include <poll.h>
 #include <pthread.h>
 #include <regex.h>
+#include <strings.h>
+#include <sys/ioctl.h>
+#include <sys/wait.h>
+#include <unistd.h>
+#endif
 #include <signal.h>
 #include <stdarg.h>
 #include <stdbool.h>
@@ -22,12 +30,8 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <strings.h>
-#include <sys/ioctl.h>
 #include <sys/stat.h>
-#include <sys/wait.h>
 #include <time.h>
-#include <unistd.h>
 
 /* This is intentionally not in linenoise.h, but it is part of the existing
  * multiplexed editor implementation.  The agent uses it only to restore text
@@ -8150,6 +8154,21 @@ static bool worker_check_raw_mode_restore(agent_worker *w) {
 
 static void drain_wake_fd(int fd) {
     char buf[128];
+#if defined(_WIN32)
+    intptr_t osfh = _get_osfhandle(fd);
+    if (osfh != -1) {
+        HANDLE h = (HANDLE)osfh;
+        for (;;) {
+            DWORD avail = 0;
+            if (!PeekNamedPipe(h, NULL, 0, NULL, &avail, NULL) || avail == 0)
+                break;
+            unsigned int chunk = avail < sizeof(buf) ? avail : (unsigned int)sizeof(buf);
+            int n = read(fd, buf, chunk);
+            if (n <= 0) break;
+        }
+        return;
+    }
+#endif
     for (;;) {
         ssize_t n = read(fd, buf, sizeof(buf));
         if (n > 0) continue;
@@ -9786,10 +9805,126 @@ static int run_agent_non_interactive(ds4_engine *engine, agent_config *cfg) {
     return rc;
 }
 
+#if defined(_WIN32)
+static int agent_win32_consume_worker(agent_worker *worker, agent_status *status_out) {
+    char *out = NULL;
+    size_t out_len = 0;
+    agent_status st = {0};
+    worker_consume(worker, &out, &out_len, &st);
+    if (out && out_len) {
+        write_all(STDOUT_FILENO, out, out_len);
+        fflush(stdout);
+    }
+    free(out);
+    if (worker_take_queued_user_drain_request(worker))
+        worker_answer_queued_user_drain(worker, NULL);
+    if (status_out) *status_out = st;
+    if (st.state == AGENT_WORKER_ERROR) {
+        fprintf(stderr, "ds4-agent: %s\n",
+                st.error[0] ? st.error : "worker error");
+        return -1;
+    }
+    return 0;
+}
+
+static int agent_win32_wait_worker(agent_worker *worker, bool until_idle) {
+    for (;;) {
+        struct pollfd pfd = {.fd = worker->wake_fd[0], .events = POLLIN};
+        (void)poll(&pfd, 1, 100);
+        if (pfd.revents & POLLIN) drain_wake_fd(worker->wake_fd[0]);
+
+        agent_status st = {0};
+        if (agent_win32_consume_worker(worker, &st) != 0) return -1;
+        if (!worker_is_initialized(worker, NULL)) continue;
+        if (!until_idle || worker_is_idle(worker)) return 0;
+    }
+}
+
+static char *agent_win32_read_line(const char *prompt) {
+    if (prompt) {
+        fputs(prompt, stdout);
+        fflush(stdout);
+    }
+    agent_input_buf line = {0};
+    char buf[4096];
+    for (;;) {
+        if (!fgets(buf, sizeof(buf), stdin)) {
+            agent_input_buf_free(&line);
+            return NULL;
+        }
+        agent_input_buf_append(&line, buf, strlen(buf));
+        size_t n = line.len;
+        if (n && line.ptr[n - 1] == '\n') break;
+        if (feof(stdin)) break;
+    }
+    while (line.len && (line.ptr[line.len - 1] == '\n' ||
+                        line.ptr[line.len - 1] == '\r'))
+        line.ptr[--line.len] = '\0';
+    return agent_input_buf_take(&line);
+}
+
+static int run_agent_win32_basic(ds4_engine *engine, agent_config *cfg) {
+    agent_worker worker;
+    if (agent_worker_init(&worker, engine, cfg) != 0) return 1;
+
+    printf("DwarfStar Agent for Windows basic console mode.\n");
+    printf("Type /exit or /quit to leave. Browser and shell job tools are limited in this build.\n\n");
+    fflush(stdout);
+
+    int rc = 0;
+    if (agent_win32_wait_worker(&worker, false) != 0) {
+        rc = 1;
+        goto done;
+    }
+
+    char *pending = cfg->gen.prompt && cfg->gen.prompt[0] ?
+        xstrdup(cfg->gen.prompt) : NULL;
+    for (;;) {
+        char *line = pending ? pending : agent_win32_read_line("ds4-agent> ");
+        pending = NULL;
+        if (!line) break;
+        if (!strcmp(line, "/exit") || !strcmp(line, "/quit") ||
+            !strcmp(line, "/q")) {
+            free(line);
+            break;
+        }
+        if (!strcmp(line, "/help")) {
+            puts("Windows basic console commands: /help, /exit, /quit.");
+            free(line);
+            continue;
+        }
+        if (!line[0]) {
+            free(line);
+            continue;
+        }
+
+        agent_echo_user_prompt(line);
+        if (!worker_submit(&worker, line)) {
+            fprintf(stderr, "ds4-agent: worker is busy; prompt was not submitted\n");
+            free(line);
+            continue;
+        }
+        free(line);
+
+        if (agent_win32_wait_worker(&worker, true) != 0) {
+            rc = 1;
+            break;
+        }
+    }
+
+done:
+    agent_worker_free(&worker);
+    return rc;
+}
+#endif
+
 /* Main UI loop.  poll() multiplexes stdin with the worker wake pipe; all
  * terminal writes go through editor_write_async() so linenoise, status footer,
  * model output, and tool output never race each other. */
 static int run_agent(ds4_engine *engine, agent_config *cfg) {
+#if defined(_WIN32)
+    return run_agent_win32_basic(engine, cfg);
+#endif
     agent_worker worker;
     if (agent_worker_init(&worker, engine, cfg) != 0) return 1;
 
@@ -10213,6 +10348,9 @@ static int run_agent(ds4_engine *engine, agent_config *cfg) {
 
 #ifndef DS4_AGENT_TEST_NO_MAIN
 int main(int argc, char **argv) {
+#if defined(_WIN32)
+    ds4_win32_enable_utf8_console();
+#endif
     agent_config cfg = parse_options(argc, argv);
     if (cfg.chdir_path && chdir(cfg.chdir_path) != 0) {
         fprintf(stderr, "ds4-agent: failed to chdir to %s: %s\n",

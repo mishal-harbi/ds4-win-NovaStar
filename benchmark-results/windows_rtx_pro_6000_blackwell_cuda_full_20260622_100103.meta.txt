@@ -1,0 +1,34 @@
+name=windows_rtx_pro_6000_blackwell_cuda_full
+date=2026-06-22T10:01:03.8785005+03:00
+model=.\gguf\DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix.gguf
+prompt_file=.\speed-bench\promessi_sposi.txt
+ctx_start=2048
+ctx_max=65536
+step_incr=2048
+gen_tokens=128
+mode=full_cuda_residency
+
+[gpu_before]
+NVIDIA RTX PRO 6000 Blackwell Workstation Edition, 596.36, 97887, 1964, 94625
+
+[model_inspect]
+model: DeepSeek V4 Flash
+arch:  deepseek4
+gguf:  v3, 62 metadata keys, 1328 tensors
+layers: 43
+attention: heads=64 kv_heads=1 head_dim=512 swa=128
+indexer: heads=64 head_dim=128 top_k=512
+experts: count=256 used=6 groups=0 groups_used=0
+file size: 80.76 GiB
+tensor bytes described by GGUF: 80.76 GiB
+logical parameters: 284.33 B
+tensor types:
+  f32        492 tensors, 0.00 GiB
+  f16        359 tensors, 2.04 GiB
+  q8_0       345 tensors, 6.15 GiB
+  q2_k        43 tensors, 28.22 GiB
+  iq2_xxs     86 tensors, 44.34 GiB
+  i32          3 tensors, 0.01 GiB
+
+[gpu_after]
+NVIDIA RTX PRO 6000 Blackwell Workstation Edition, 596.36, 97887, 2096, 94493

@@ -14,7 +14,11 @@
 #include <string.h>
 #include <sys/stat.h>
 #include <time.h>
+#if defined(_WIN32)
+#include "ds4_win32.h"
+#else
 #include <unistd.h>
+#endif
 #include <unordered_map>
 #include <vector>
 
@@ -25,7 +29,11 @@
 #endif
 
 #define CUDA_QK_K 256
+#if defined(_MSC_VER)
+#define DS4_CUDA_UNUSED
+#else
 #define DS4_CUDA_UNUSED __attribute__((unused))
+#endif
 
 enum {
     /* attention_decode_mixed_kernel stores raw-window scores plus visible
@@ -92,6 +100,9 @@ static cublasHandle_t g_cublas;
 static int g_cublas_ready;
 static int g_quality_mode;
 static int g_ssd_streaming_mode;
+static int g_indexed_f16_kv_notice_printed;
+static int g_indexed_attention_plan_notice_count;
+static int g_fp8_raw_store_notice_count;
 
 struct cuda_model_range {
     const void *host_base;
@@ -184,6 +195,37 @@ struct cuda_stream_expert_cache {
     std::vector<cuda_stream_expert_cache_slot> slots;
 };
 
+struct cuda_stream_host_expert_cache_slot {
+    int valid;
+    const void *model_map;
+    uint64_t model_size;
+    uint32_t layer;
+    uint32_t n_total_expert;
+    uint32_t expert;
+    uint64_t gate_offset;
+    uint64_t up_offset;
+    uint64_t down_offset;
+    uint64_t gate_expert_bytes;
+    uint64_t down_expert_bytes;
+    uint64_t age;
+};
+
+struct cuda_stream_host_expert_cache {
+    int valid;
+    uint32_t capacity;
+    uint32_t count;
+    uint64_t tick;
+    uint64_t gate_expert_bytes;
+    uint64_t down_expert_bytes;
+    char *gate_ptr;
+    char *up_ptr;
+    char *down_ptr;
+    uint64_t gate_capacity;
+    uint64_t up_capacity;
+    uint64_t down_capacity;
+    std::vector<cuda_stream_host_expert_cache_slot> slots;
+};
+
 static std::vector<cuda_model_range> g_model_ranges;
 static std::vector<cuda_model_arena> g_model_arenas;
 static std::unordered_map<uint64_t, size_t> g_model_range_by_offset;
@@ -193,7 +235,9 @@ static std::vector<cuda_q8_f32_range> g_q8_f32_ranges;
 static std::unordered_map<uint64_t, size_t> g_q8_f32_by_offset;
 static cuda_stream_selected_cache g_stream_selected_cache;
 static cuda_stream_expert_cache g_stream_expert_cache;
+static cuda_stream_host_expert_cache g_stream_host_expert_cache;
 static uint32_t g_stream_expert_budget_override;
+static uint32_t g_stream_host_expert_budget_override;
 static uint32_t g_stream_expert_runtime_cap;
 static uint32_t g_stream_expert_memory_cap_notice;
 static uint64_t g_stream_expert_runtime_gate_bytes;
@@ -1056,7 +1100,12 @@ static int cuda_pread_full(int fd, void *buf, uint64_t bytes, uint64_t offset) {
     uint64_t done = 0;
     while (done < bytes) {
         const size_t n_req = (bytes - done > (uint64_t)SSIZE_MAX) ? (size_t)SSIZE_MAX : (size_t)(bytes - done);
-        ssize_t n = pread(fd, (char *)buf + done, n_req, (off_t)(offset + done));
+#if defined(_WIN32)
+        const int64_t read_offset = (int64_t)(offset + done);
+#else
+        const off_t read_offset = (off_t)(offset + done);
+#endif
+        ssize_t n = pread(fd, (char *)buf + done, n_req, read_offset);
         if (n < 0) {
             if (errno == EINTR) continue;
             return 0;
@@ -2008,6 +2057,393 @@ static int cuda_stream_expert_cache_copy_to_compact(
                    "streaming selected down cache copy");
 }
 
+static void cuda_stream_host_expert_cache_release_all(void) {
+    free(g_stream_host_expert_cache.gate_ptr);
+    free(g_stream_host_expert_cache.up_ptr);
+    free(g_stream_host_expert_cache.down_ptr);
+    g_stream_host_expert_cache.slots.clear();
+    memset(&g_stream_host_expert_cache, 0, sizeof(g_stream_host_expert_cache));
+}
+
+static void cuda_stream_host_expert_cache_invalidate(void) {
+    for (cuda_stream_host_expert_cache_slot &slot : g_stream_host_expert_cache.slots) {
+        slot.valid = 0;
+    }
+    g_stream_host_expert_cache.valid = 0;
+    g_stream_host_expert_cache.count = 0;
+    g_stream_host_expert_cache.tick = 0;
+}
+
+static uint32_t cuda_stream_host_expert_cache_requested_budget(void) {
+    uint32_t cap = g_stream_host_expert_budget_override;
+    const char *env = getenv("DS4_CUDA_STREAMING_HOST_CACHE_N");
+    if (env && env[0]) {
+        char *end = NULL;
+        errno = 0;
+        unsigned long v = strtoul(env, &end, 10);
+        while (end && (*end == ' ' || *end == '\t')) end++;
+        if (end != env && errno == 0 && end && *end == '\0') {
+            cap = v > DS4_CUDA_STREAM_EXPERT_MAX ?
+                DS4_CUDA_STREAM_EXPERT_MAX : (uint32_t)v;
+        }
+    }
+    if (cap > DS4_CUDA_STREAM_EXPERT_MAX) cap = DS4_CUDA_STREAM_EXPERT_MAX;
+    return cap;
+}
+
+static int cuda_stream_host_expert_cache_enabled(void) {
+    return g_ssd_streaming_mode &&
+           cuda_stream_host_expert_cache_requested_budget() != 0;
+}
+
+static uint32_t cuda_stream_host_expert_cache_shrunken_cap(uint32_t cap) {
+    if (cap == 0) return 0;
+    const uint32_t release = (cap + 9u) / 10u;
+    return cap > release ? cap - release : 0;
+}
+
+static int cuda_stream_host_expert_cache_try_alloc(
+        uint32_t cap,
+        uint64_t gate_expert_bytes,
+        uint64_t down_expert_bytes,
+        char **gate_ptr,
+        char **up_ptr,
+        char **down_ptr) {
+    *gate_ptr = NULL;
+    *up_ptr = NULL;
+    *down_ptr = NULL;
+    if (cap == 0 ||
+        (uint64_t)cap > UINT64_MAX / gate_expert_bytes ||
+        (uint64_t)cap > UINT64_MAX / down_expert_bytes) {
+        return 0;
+    }
+    const uint64_t gate_bytes = (uint64_t)cap * gate_expert_bytes;
+    const uint64_t down_bytes = (uint64_t)cap * down_expert_bytes;
+    if (gate_bytes > (uint64_t)SIZE_MAX ||
+        down_bytes > (uint64_t)SIZE_MAX) {
+        return 0;
+    }
+
+    char *gate = (char *)malloc((size_t)gate_bytes);
+    char *up = (char *)malloc((size_t)gate_bytes);
+    char *down = (char *)malloc((size_t)down_bytes);
+    if (!gate || !up || !down) {
+        free(gate);
+        free(up);
+        free(down);
+        return 0;
+    }
+
+    *gate_ptr = gate;
+    *up_ptr = up;
+    *down_ptr = down;
+    return 1;
+}
+
+static cuda_stream_host_expert_cache *cuda_stream_host_expert_cache_prepare(
+        uint64_t gate_expert_bytes,
+        uint64_t down_expert_bytes,
+        uint32_t target_cap) {
+    const uint64_t expert_bytes =
+        cuda_stream_expert_cache_expert_bytes(gate_expert_bytes,
+                                              down_expert_bytes);
+    if (expert_bytes == 0 || !cuda_stream_host_expert_cache_enabled()) {
+        return NULL;
+    }
+
+    uint32_t requested_cap = cuda_stream_host_expert_cache_requested_budget();
+    if (target_cap == 0 || target_cap > requested_cap) target_cap = requested_cap;
+    if (target_cap == 0) return NULL;
+
+    const int same_dims =
+        g_stream_host_expert_cache.valid &&
+        g_stream_host_expert_cache.gate_expert_bytes == gate_expert_bytes &&
+        g_stream_host_expert_cache.down_expert_bytes == down_expert_bytes;
+    if (!same_dims && g_stream_host_expert_cache.valid) {
+        cuda_stream_host_expert_cache_release_all();
+    }
+    if (same_dims &&
+        g_stream_host_expert_cache.capacity != 0 &&
+        g_stream_host_expert_cache.capacity >= target_cap &&
+        g_stream_host_expert_cache.slots.size() == g_stream_host_expert_cache.capacity) {
+        return &g_stream_host_expert_cache;
+    }
+
+    cuda_stream_host_expert_cache_release_all();
+    uint32_t cap = target_cap;
+    while (cap != 0) {
+        if ((uint64_t)cap > UINT64_MAX / gate_expert_bytes ||
+            (uint64_t)cap > UINT64_MAX / down_expert_bytes) {
+            return NULL;
+        }
+
+        char *gate_ptr = NULL;
+        char *up_ptr = NULL;
+        char *down_ptr = NULL;
+        if (!cuda_stream_host_expert_cache_try_alloc(cap,
+                                                     gate_expert_bytes,
+                                                     down_expert_bytes,
+                                                     &gate_ptr,
+                                                     &up_ptr,
+                                                     &down_ptr)) {
+            const uint32_t new_cap =
+                cuda_stream_host_expert_cache_shrunken_cap(cap);
+            cuda_model_load_progress_finish();
+            fprintf(stderr,
+                    "ds4: CUDA RAM expert cache allocation failed at %u experts "
+                    "/ %.2f GiB; retrying with %u experts\n",
+                    cap,
+                    (double)((uint64_t)cap * expert_bytes) / 1073741824.0,
+                    new_cap);
+            cap = new_cap;
+            continue;
+        }
+
+        try {
+            g_stream_host_expert_cache.slots.resize(cap);
+        } catch (...) {
+            fprintf(stderr, "ds4: CUDA RAM expert cache metadata allocation failed\n");
+            free(gate_ptr);
+            free(up_ptr);
+            free(down_ptr);
+            cuda_stream_host_expert_cache_release_all();
+            return NULL;
+        }
+
+        g_stream_host_expert_cache.valid = 1;
+        g_stream_host_expert_cache.capacity = cap;
+        g_stream_host_expert_cache.count = 0;
+        g_stream_host_expert_cache.tick = 0;
+        g_stream_host_expert_cache.gate_expert_bytes = gate_expert_bytes;
+        g_stream_host_expert_cache.down_expert_bytes = down_expert_bytes;
+        g_stream_host_expert_cache.gate_ptr = gate_ptr;
+        g_stream_host_expert_cache.up_ptr = up_ptr;
+        g_stream_host_expert_cache.down_ptr = down_ptr;
+        g_stream_host_expert_cache.gate_capacity =
+            (uint64_t)cap * gate_expert_bytes;
+        g_stream_host_expert_cache.up_capacity =
+            (uint64_t)cap * gate_expert_bytes;
+        g_stream_host_expert_cache.down_capacity =
+            (uint64_t)cap * down_expert_bytes;
+        cuda_model_load_progress_finish();
+        fprintf(stderr,
+                "ds4: CUDA RAM expert cache allocated %u experts / %.2f GiB\n",
+                cap,
+                (double)((uint64_t)cap * expert_bytes) / 1073741824.0);
+        return &g_stream_host_expert_cache;
+    }
+    return NULL;
+}
+
+static int cuda_stream_host_expert_cache_find(
+        cuda_stream_host_expert_cache *cache,
+        const void *model_map,
+        uint64_t model_size,
+        uint32_t layer,
+        uint32_t n_total_expert,
+        uint32_t expert,
+        uint64_t gate_offset,
+        uint64_t up_offset,
+        uint64_t down_offset,
+        uint64_t gate_expert_bytes,
+        uint64_t down_expert_bytes) {
+    if (!cache || !cache->valid) return -1;
+    for (uint32_t i = 0; i < cache->capacity; i++) {
+        const cuda_stream_host_expert_cache_slot &slot = cache->slots[i];
+        if (slot.valid &&
+            slot.model_map == model_map &&
+            slot.model_size == model_size &&
+            slot.layer == layer &&
+            slot.n_total_expert == n_total_expert &&
+            slot.expert == expert &&
+            slot.gate_offset == gate_offset &&
+            slot.up_offset == up_offset &&
+            slot.down_offset == down_offset &&
+            slot.gate_expert_bytes == gate_expert_bytes &&
+            slot.down_expert_bytes == down_expert_bytes) {
+            return (int)i;
+        }
+    }
+    return -1;
+}
+
+static uint32_t cuda_stream_host_expert_cache_lru_slot(
+        cuda_stream_host_expert_cache *cache) {
+    for (uint32_t i = 0; i < cache->capacity; i++) {
+        if (!cache->slots[i].valid) return i;
+    }
+    uint32_t slot = 0;
+    uint64_t best_age = cache->slots[0].age;
+    for (uint32_t i = 1; i < cache->capacity; i++) {
+        if (cache->slots[i].age < best_age) {
+            best_age = cache->slots[i].age;
+            slot = i;
+        }
+    }
+    return slot;
+}
+
+static int cuda_model_read_to_host(
+        char *dst,
+        const void *model_map,
+        uint64_t model_size,
+        uint64_t offset,
+        uint64_t bytes,
+        const char *what) {
+    if (!dst || !model_map || offset > model_size || bytes > model_size - offset) {
+        return 0;
+    }
+    if (bytes == 0) return 1;
+    if (g_model_fd >= 0 &&
+        (g_model_fd_host_base == NULL || model_map == g_model_fd_host_base)) {
+        if (!cuda_pread_full(g_model_fd, dst, bytes, offset)) {
+            fprintf(stderr,
+                    "ds4: CUDA RAM expert cache read failed for %s: %s\n",
+                    what ? what : "expert",
+                    strerror(errno));
+            return 0;
+        }
+        return 1;
+    }
+    memcpy(dst, (const char *)model_map + offset, (size_t)bytes);
+    return 1;
+}
+
+static int cuda_stream_host_expert_cache_load_slot(
+        cuda_stream_host_expert_cache *cache,
+        const void *model_map,
+        uint64_t model_size,
+        uint32_t slot,
+        uint32_t layer,
+        uint32_t n_total_expert,
+        uint32_t expert,
+        uint64_t gate_offset,
+        uint64_t up_offset,
+        uint64_t down_offset,
+        uint64_t gate_expert_bytes,
+        uint64_t down_expert_bytes) {
+    const uint64_t gate_src =
+        gate_offset + (uint64_t)expert * gate_expert_bytes;
+    const uint64_t up_src =
+        up_offset + (uint64_t)expert * gate_expert_bytes;
+    const uint64_t down_src =
+        down_offset + (uint64_t)expert * down_expert_bytes;
+    const uint64_t gate_dst = (uint64_t)slot * gate_expert_bytes;
+    const uint64_t down_dst = (uint64_t)slot * down_expert_bytes;
+
+    if (!cuda_model_read_to_host(cache->gate_ptr + gate_dst,
+                                 model_map,
+                                 model_size,
+                                 gate_src,
+                                 gate_expert_bytes,
+                                 "RAM cached moe_gate") ||
+        !cuda_model_read_to_host(cache->up_ptr + gate_dst,
+                                 model_map,
+                                 model_size,
+                                 up_src,
+                                 gate_expert_bytes,
+                                 "RAM cached moe_up") ||
+        !cuda_model_read_to_host(cache->down_ptr + down_dst,
+                                 model_map,
+                                 model_size,
+                                 down_src,
+                                 down_expert_bytes,
+                                 "RAM cached moe_down")) {
+        return 0;
+    }
+
+    cuda_stream_host_expert_cache_slot &entry = cache->slots[slot];
+    entry.valid = 1;
+    entry.model_map = model_map;
+    entry.model_size = model_size;
+    entry.layer = layer;
+    entry.n_total_expert = n_total_expert;
+    entry.expert = expert;
+    entry.gate_offset = gate_offset;
+    entry.up_offset = up_offset;
+    entry.down_offset = down_offset;
+    entry.gate_expert_bytes = gate_expert_bytes;
+    entry.down_expert_bytes = down_expert_bytes;
+    entry.age = ++cache->tick;
+    return 1;
+}
+
+static int cuda_stream_host_expert_cache_get_slot(
+        cuda_stream_host_expert_cache *cache,
+        const void *model_map,
+        uint64_t model_size,
+        uint32_t layer,
+        uint32_t n_total_expert,
+        uint32_t expert,
+        uint64_t gate_offset,
+        uint64_t up_offset,
+        uint64_t down_offset,
+        uint64_t gate_expert_bytes,
+        uint64_t down_expert_bytes,
+        int *was_hit) {
+    if (was_hit) *was_hit = 0;
+    int slot = cuda_stream_host_expert_cache_find(cache,
+                                                  model_map,
+                                                  model_size,
+                                                  layer,
+                                                  n_total_expert,
+                                                  expert,
+                                                  gate_offset,
+                                                  up_offset,
+                                                  down_offset,
+                                                  gate_expert_bytes,
+                                                  down_expert_bytes);
+    if (slot >= 0) {
+        cache->slots[(uint32_t)slot].age = ++cache->tick;
+        if (was_hit) *was_hit = 1;
+        return slot;
+    }
+
+    const uint32_t load_slot = cuda_stream_host_expert_cache_lru_slot(cache);
+    const int append = !cache->slots[load_slot].valid;
+    if (!cuda_stream_host_expert_cache_load_slot(cache,
+                                                 model_map,
+                                                 model_size,
+                                                 load_slot,
+                                                 layer,
+                                                 n_total_expert,
+                                                 expert,
+                                                 gate_offset,
+                                                 up_offset,
+                                                 down_offset,
+                                                 gate_expert_bytes,
+                                                 down_expert_bytes)) {
+        return -1;
+    }
+    if (append && cache->count < cache->capacity) cache->count++;
+    return (int)load_slot;
+}
+
+static int cuda_stream_host_expert_cache_copy_to_device(
+        cuda_stream_host_expert_cache *cache,
+        uint32_t cache_slot,
+        char *gate_dst_ptr,
+        char *up_dst_ptr,
+        char *down_dst_ptr) {
+    const uint64_t gate_src = (uint64_t)cache_slot * cache->gate_expert_bytes;
+    const uint64_t down_src = (uint64_t)cache_slot * cache->down_expert_bytes;
+    return cuda_ok(cudaMemcpy(gate_dst_ptr,
+                              cache->gate_ptr + gate_src,
+                              (size_t)cache->gate_expert_bytes,
+                              cudaMemcpyHostToDevice),
+                   "RAM cached gate expert upload") &&
+           cuda_ok(cudaMemcpy(up_dst_ptr,
+                              cache->up_ptr + gate_src,
+                              (size_t)cache->gate_expert_bytes,
+                              cudaMemcpyHostToDevice),
+                   "RAM cached up expert upload") &&
+           cuda_ok(cudaMemcpy(down_dst_ptr,
+                              cache->down_ptr + down_src,
+                              (size_t)cache->down_expert_bytes,
+                              cudaMemcpyHostToDevice),
+                   "RAM cached down expert upload");
+}
+
 static int cuda_stream_expert_cache_load_slot(
         cuda_stream_expert_cache *cache,
         const void *model_map,
@@ -2029,25 +2465,68 @@ static int cuda_stream_expert_cache_load_slot(
         down_offset + (uint64_t)expert * down_expert_bytes;
     const uint64_t gate_dst = (uint64_t)slot * gate_expert_bytes;
     const uint64_t down_dst = (uint64_t)slot * down_expert_bytes;
-    if (!cuda_model_copy_to_device_streamed(cache->gate_ptr + gate_dst,
-                                            model_map,
-                                            model_size,
-                                            gate_src,
-                                            gate_expert_bytes,
-                                            "cached moe_gate") ||
-        !cuda_model_copy_to_device_streamed(cache->up_ptr + gate_dst,
-                                            model_map,
-                                            model_size,
-                                            up_src,
-                                            gate_expert_bytes,
-                                            "cached moe_up") ||
-        !cuda_model_copy_to_device_streamed(cache->down_ptr + down_dst,
-                                            model_map,
-                                            model_size,
-                                            down_src,
-                                            down_expert_bytes,
-                                            "cached moe_down")) {
-        return 0;
+
+    int copied_from_host_cache = 0;
+    cuda_stream_host_expert_cache *host_cache =
+        cuda_stream_host_expert_cache_prepare(gate_expert_bytes,
+                                              down_expert_bytes,
+                                              0);
+    if (host_cache) {
+        int was_hit = 0;
+        const int host_slot =
+            cuda_stream_host_expert_cache_get_slot(host_cache,
+                                                   model_map,
+                                                   model_size,
+                                                   layer,
+                                                   n_total_expert,
+                                                   expert,
+                                                   gate_offset,
+                                                   up_offset,
+                                                   down_offset,
+                                                   gate_expert_bytes,
+                                                   down_expert_bytes,
+                                                   &was_hit);
+        if (host_slot >= 0) {
+            copied_from_host_cache =
+                cuda_stream_host_expert_cache_copy_to_device(
+                        host_cache,
+                        (uint32_t)host_slot,
+                        cache->gate_ptr + gate_dst,
+                        cache->up_ptr + gate_dst,
+                        cache->down_ptr + down_dst);
+            if (getenv("DS4_CUDA_STREAMING_HOST_CACHE_VERBOSE")) {
+                fprintf(stderr,
+                        "ds4: CUDA RAM expert cache %s layer=%u expert=%u count=%u/%u\n",
+                        was_hit ? "hit" : "miss",
+                        layer,
+                        expert,
+                        host_cache->count,
+                        host_cache->capacity);
+            }
+        }
+    }
+
+    if (!copied_from_host_cache) {
+        if (!cuda_model_copy_to_device_streamed(cache->gate_ptr + gate_dst,
+                                                model_map,
+                                                model_size,
+                                                gate_src,
+                                                gate_expert_bytes,
+                                                "cached moe_gate") ||
+            !cuda_model_copy_to_device_streamed(cache->up_ptr + gate_dst,
+                                                model_map,
+                                                model_size,
+                                                up_src,
+                                                gate_expert_bytes,
+                                                "cached moe_up") ||
+            !cuda_model_copy_to_device_streamed(cache->down_ptr + down_dst,
+                                                model_map,
+                                                model_size,
+                                                down_src,
+                                                down_expert_bytes,
+                                                "cached moe_down")) {
+            return 0;
+        }
     }
     cuda_stream_expert_cache_slot &entry = cache->slots[slot];
     entry.valid = 1;
@@ -2281,6 +2760,7 @@ extern "C" void ds4_gpu_cleanup(void) {
     }
     cuda_stream_selected_cache_release();
     cuda_stream_expert_cache_release_all();
+    cuda_stream_host_expert_cache_release_all();
     cuda_stream_selected_stage_release();
     cuda_model_range_release_all();
     cuda_model_load_progress_reset();
@@ -2337,6 +2817,10 @@ extern "C" void ds4_gpu_cleanup(void) {
     g_model_cache_full = 0;
     g_model_mapping_failure_notice_printed = 0;
     g_ssd_streaming_mode = 0;
+    g_stream_host_expert_budget_override = 0;
+    g_indexed_f16_kv_notice_printed = 0;
+    g_indexed_attention_plan_notice_count = 0;
+    g_fp8_raw_store_notice_count = 0;
     if (g_model_prefetch_stream) {
         (void)cudaStreamDestroy(g_model_prefetch_stream);
         g_model_prefetch_stream = NULL;
@@ -2344,6 +2828,10 @@ extern "C" void ds4_gpu_cleanup(void) {
 }
 
 __global__ static void fill_f32_kernel(float *x, uint64_t n, float v);
+__global__ static void f32_to_f16_kernel(__half *out, const float *x, uint64_t n);
+__global__ static void f32_rows_to_q8_kv_kernel(char *dst, const float *src,
+                                                uint32_t rows, uint32_t head_dim,
+                                                uint64_t dst_row_bytes);
 
 extern "C" ds4_gpu_tensor *ds4_gpu_tensor_alloc(uint64_t bytes) {
     if (bytes == 0) bytes = 1;
@@ -2476,6 +2964,57 @@ extern "C" int ds4_gpu_tensor_copy(ds4_gpu_tensor *dst, uint64_t dst_offset,
                    "tensor copy");
 }
 
+extern "C" int ds4_gpu_tensor_copy_f32_to_f16(ds4_gpu_tensor *dst, uint64_t dst_offset,
+                                              const ds4_gpu_tensor *src, uint64_t src_offset,
+                                              uint64_t count) {
+    if (!dst || !src) return 0;
+    if (count == 0) return 1;
+    if (count > UINT64_MAX / sizeof(float) ||
+        count > UINT64_MAX / sizeof(__half)) {
+        return 0;
+    }
+    const uint64_t src_bytes = count * sizeof(float);
+    const uint64_t dst_bytes = count * sizeof(__half);
+    if (src_offset > src->bytes || src_bytes > src->bytes - src_offset ||
+        dst_offset > dst->bytes || dst_bytes > dst->bytes - dst_offset) {
+        return 0;
+    }
+    f32_to_f16_kernel<<<(count + 255u) / 256u, 256>>>(
+            (__half *)((char *)dst->ptr + dst_offset),
+            (const float *)((const char *)src->ptr + src_offset),
+            count);
+    return cuda_ok(cudaGetLastError(), "tensor copy f32 to f16 launch");
+}
+
+extern "C" int ds4_gpu_tensor_copy_f32_to_q8_kv(ds4_gpu_tensor *dst, uint64_t dst_offset,
+                                                const ds4_gpu_tensor *src, uint64_t src_offset,
+                                                uint32_t rows, uint32_t head_dim,
+                                                uint64_t dst_row_bytes) {
+    if (!dst || !src) return 0;
+    if (rows == 0) return 1;
+    if (head_dim == 0 || dst_row_bytes < sizeof(float) + (uint64_t)head_dim) {
+        return 0;
+    }
+    if ((uint64_t)rows > UINT64_MAX / head_dim ||
+        (uint64_t)rows * head_dim > UINT64_MAX / sizeof(float) ||
+        (uint64_t)rows > UINT64_MAX / dst_row_bytes) {
+        return 0;
+    }
+    const uint64_t src_bytes = (uint64_t)rows * head_dim * sizeof(float);
+    const uint64_t dst_bytes = (uint64_t)rows * dst_row_bytes;
+    if (src_offset > src->bytes || src_bytes > src->bytes - src_offset ||
+        dst_offset > dst->bytes || dst_bytes > dst->bytes - dst_offset) {
+        return 0;
+    }
+    f32_rows_to_q8_kv_kernel<<<rows, 256>>>(
+            (char *)dst->ptr + dst_offset,
+            (const float *)((const char *)src->ptr + src_offset),
+            rows,
+            head_dim,
+            dst_row_bytes);
+    return cuda_ok(cudaGetLastError(), "tensor copy f32 to q8 kv launch");
+}
+
 extern "C" int ds4_gpu_begin_commands(void) { return 1; }
 extern "C" int ds4_gpu_flush_commands(void) { return cuda_ok(cudaDeviceSynchronize(), "flush"); }
 extern "C" int ds4_gpu_signal_selected_readback_ready(uint64_t *event_value) {
@@ -2541,6 +3080,8 @@ static int cuda_model_set_host_map(const void *model_map, uint64_t model_size) {
     g_model_hmm_direct = 0;
     g_model_cache_full = 0;
     g_model_mapping_failure_notice_printed = 0;
+    g_indexed_attention_plan_notice_count = 0;
+    g_fp8_raw_store_notice_count = 0;
     if (g_model_fd >= 0 && g_model_fd_host_base == NULL) {
         g_model_fd_host_base = model_map;
     }
@@ -2675,11 +3216,19 @@ extern "C" int ds4_gpu_set_model_fd_for_map(int fd, const void *model_map) {
     }
     g_model_direct_align = 1;
     if (fd >= 0) {
+#if defined(_WIN32)
+        struct _stat64 st;
+        if (_fstat64(fd, &st) == 0 && st.st_size > 0) {
+            g_model_file_size = (uint64_t)st.st_size;
+            g_model_direct_align = 4096;
+        }
+#else
         struct stat st;
         if (fstat(fd, &st) == 0 && st.st_size > 0) {
             g_model_file_size = (uint64_t)st.st_size;
             if (st.st_blksize > 1) g_model_direct_align = (uint64_t)st.st_blksize;
         }
+#endif
 #if defined(__linux__) && defined(O_DIRECT)
         if (getenv("DS4_CUDA_NO_DIRECT_IO") == NULL) {
             char proc_path[64];
@@ -2763,6 +3312,7 @@ extern "C" void ds4_gpu_set_ssd_streaming(bool enabled) {
     if (!g_ssd_streaming_mode) {
         cuda_stream_selected_cache_release();
         cuda_stream_expert_cache_release_all();
+        cuda_stream_host_expert_cache_release_all();
     }
 }
 
@@ -2774,6 +3324,11 @@ extern "C" void ds4_gpu_set_streaming_expert_cache_budget(uint32_t experts) {
     g_stream_expert_memory_cap_notice = 0;
     cuda_stream_selected_cache_invalidate();
     cuda_stream_expert_cache_release_all();
+}
+
+extern "C" void ds4_gpu_set_streaming_host_expert_cache_budget(uint32_t experts) {
+    g_stream_host_expert_budget_override = experts;
+    cuda_stream_host_expert_cache_release_all();
 }
 
 extern "C" void ds4_gpu_set_streaming_expert_cache_expert_bytes(uint64_t bytes) {
@@ -2791,6 +3346,15 @@ extern "C" uint32_t ds4_gpu_stream_expert_cache_configured_count(void) {
 
 extern "C" uint32_t ds4_gpu_stream_expert_cache_current_count(void) {
     return g_stream_expert_cache.count;
+}
+
+extern "C" uint32_t ds4_gpu_stream_host_expert_cache_configured_count(void) {
+    if (!g_ssd_streaming_mode) return 0;
+    return cuda_stream_host_expert_cache_requested_budget();
+}
+
+extern "C" uint32_t ds4_gpu_stream_host_expert_cache_current_count(void) {
+    return g_stream_host_expert_cache.count;
 }
 
 extern "C" void ds4_gpu_stream_expert_cache_reset_route_hotness(void) {
@@ -2961,6 +3525,8 @@ static int cuda_stream_selected_cache_begin_compact_load(
         expert_cache && expert_cache->valid ? expert_cache->count : 0;
     uint32_t cache_hits = 0;
     uint32_t cache_misses = 0;
+    uint32_t host_cache_hits = 0;
+    uint32_t host_cache_misses = 0;
     uint32_t direct_loads = 0;
 
     for (uint32_t i = 0; i < compact_count; i++) {
@@ -3043,27 +3609,62 @@ static int cuda_stream_selected_cache_begin_compact_load(
             const uint64_t gate_src = gate_offset + expert * gate_expert_bytes;
             const uint64_t up_src = up_offset + expert * gate_expert_bytes;
             const uint64_t down_src = down_offset + expert * down_expert_bytes;
-            direct_loads++;
-            if (!cuda_model_copy_to_device_streamed(g_stream_selected_cache.gate_ptr + gate_dst,
-                                                    model_map,
-                                                    model_size,
-                                                    gate_src,
-                                                    gate_expert_bytes,
-                                                    "selected moe_gate") ||
-                !cuda_model_copy_to_device_streamed(g_stream_selected_cache.up_ptr + gate_dst,
-                                                    model_map,
-                                                    model_size,
-                                                    up_src,
-                                                    gate_expert_bytes,
-                                                    "selected moe_up") ||
-                !cuda_model_copy_to_device_streamed(g_stream_selected_cache.down_ptr + down_dst,
-                                                    model_map,
-                                                    model_size,
-                                                    down_src,
-                                                    down_expert_bytes,
-                                                    "selected moe_down")) {
-                cuda_stream_selected_cache_invalidate();
-                return strict_failure ? 0 : 1;
+            int copied_from_host_cache = 0;
+            cuda_stream_host_expert_cache *host_cache =
+                cuda_stream_host_expert_cache_prepare(gate_expert_bytes,
+                                                      down_expert_bytes,
+                                                      configured_cache_budget);
+            if (host_cache) {
+                int was_hit = 0;
+                const int host_slot =
+                    cuda_stream_host_expert_cache_get_slot(host_cache,
+                                                           model_map,
+                                                           model_size,
+                                                           layer,
+                                                           n_total_expert,
+                                                           (uint32_t)expert,
+                                                           gate_offset,
+                                                           up_offset,
+                                                           down_offset,
+                                                           gate_expert_bytes,
+                                                           down_expert_bytes,
+                                                           &was_hit);
+                if (host_slot >= 0) {
+                    copied_from_host_cache =
+                        cuda_stream_host_expert_cache_copy_to_device(
+                                host_cache,
+                                (uint32_t)host_slot,
+                                g_stream_selected_cache.gate_ptr + gate_dst,
+                                g_stream_selected_cache.up_ptr + gate_dst,
+                                g_stream_selected_cache.down_ptr + down_dst);
+                    if (was_hit) host_cache_hits++;
+                    else host_cache_misses++;
+                }
+            }
+
+            if (!copied_from_host_cache) {
+                direct_loads++;
+                if (!cuda_model_copy_to_device_streamed(g_stream_selected_cache.gate_ptr + gate_dst,
+                                                        model_map,
+                                                        model_size,
+                                                        gate_src,
+                                                        gate_expert_bytes,
+                                                        "selected moe_gate") ||
+                    !cuda_model_copy_to_device_streamed(g_stream_selected_cache.up_ptr + gate_dst,
+                                                        model_map,
+                                                        model_size,
+                                                        up_src,
+                                                        gate_expert_bytes,
+                                                        "selected moe_up") ||
+                    !cuda_model_copy_to_device_streamed(g_stream_selected_cache.down_ptr + down_dst,
+                                                        model_map,
+                                                        model_size,
+                                                        down_src,
+                                                        down_expert_bytes,
+                                                        "selected moe_down")) {
+                    cuda_stream_selected_cache_invalidate();
+                    return strict_failure ? 0 : 1;
+                }
             }
         }
     }
@@ -3098,7 +3699,7 @@ static int cuda_stream_selected_cache_begin_compact_load(
     if (getenv("DS4_CUDA_STREAMING_EXPERT_CACHE_VERBOSE")) {
         cuda_model_load_progress_finish();
         fprintf(stderr,
-                "ds4: CUDA streaming selected layer=%u slots=%u compact=%u global_budget=%u before=%u after=%u hits=%u misses=%u direct=%u gate/up %.2f MiB down %.2f MiB\n",
+                "ds4: CUDA streaming selected layer=%u slots=%u compact=%u global_budget=%u before=%u after=%u hits=%u misses=%u host_hits=%u host_misses=%u direct=%u gate/up %.2f MiB down %.2f MiB\n",
                 layer,
                 slot_count,
                 compact_count,
@@ -3107,6 +3708,8 @@ static int cuda_stream_selected_cache_begin_compact_load(
                 expert_cache && expert_cache->valid ? expert_cache->count : 0,
                 cache_hits,
                 cache_misses,
+                host_cache_hits,
+                host_cache_misses,
                 direct_loads,
                 (double)compact_gate_bytes / 1048576.0,
                 (double)compact_down_bytes / 1048576.0);
@@ -3344,6 +3947,84 @@ extern "C" int ds4_gpu_stream_expert_cache_seed_experts(
     return 1;
 }
 
+extern "C" int ds4_gpu_stream_host_expert_cache_seed_experts(
+        const ds4_gpu_stream_expert_table *table,
+        const int32_t                     *expert_ids,
+        uint32_t                           n_experts) {
+    if (!g_ssd_streaming_mode || !cuda_stream_host_expert_cache_enabled()) {
+        return 1;
+    }
+    if (!table || !expert_ids || n_experts == 0) return 0;
+    const void *model_map = table->model_map;
+    const uint64_t model_size = table->model_size;
+    const uint32_t layer = table->layer;
+    const uint32_t n_total_expert = table->n_total_expert;
+    const uint64_t gate_offset = table->gate_offset;
+    const uint64_t up_offset = table->up_offset;
+    const uint64_t down_offset = table->down_offset;
+    const uint64_t gate_expert_bytes = table->gate_expert_bytes;
+    const uint64_t down_expert_bytes = table->down_expert_bytes;
+    if (!model_map ||
+        !cuda_stream_layer_expert_ranges_valid(model_size,
+                                               n_total_expert,
+                                               gate_offset,
+                                               up_offset,
+                                               down_offset,
+                                               gate_expert_bytes,
+                                               down_expert_bytes,
+                                               "RAM preload")) {
+        return 0;
+    }
+
+    cuda_stream_host_expert_cache *cache =
+        cuda_stream_host_expert_cache_prepare(gate_expert_bytes,
+                                              down_expert_bytes,
+                                              n_experts);
+    if (!cache || cache->capacity == 0) return 1;
+
+    uint32_t hits = 0;
+    uint32_t misses = 0;
+    for (uint32_t i = 0; i < n_experts; i++) {
+        const int32_t expert_i = expert_ids[i];
+        if (expert_i < 0 || (uint32_t)expert_i >= n_total_expert) {
+            fprintf(stderr,
+                    "ds4: CUDA RAM expert cache preload expert id %d is outside 0..%u at layer %u\n",
+                    expert_i,
+                    n_total_expert,
+                    layer);
+            return 0;
+        }
+        int was_hit = 0;
+        const int slot =
+            cuda_stream_host_expert_cache_get_slot(cache,
+                                                   model_map,
+                                                   model_size,
+                                                   layer,
+                                                   n_total_expert,
+                                                   (uint32_t)expert_i,
+                                                   gate_offset,
+                                                   up_offset,
+                                                   down_offset,
+                                                   gate_expert_bytes,
+                                                   down_expert_bytes,
+                                                   &was_hit);
+        if (slot < 0) return 0;
+        if (was_hit) hits++;
+        else misses++;
+    }
+    if (getenv("DS4_CUDA_STREAMING_HOST_CACHE_VERBOSE")) {
+        fprintf(stderr,
+                "ds4: CUDA RAM expert cache preloaded layer=%u experts=%u hits=%u misses=%u count=%u/%u\n",
+                layer,
+                n_experts,
+                hits,
+                misses,
+                cache->count,
+                cache->capacity);
+    }
+    return 1;
+}
+
 __global__ static void embed_token_hc_kernel(float *out, const unsigned short *w, uint32_t token, uint32_t n_embd, uint32_t n_hc) {
     uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
     uint32_t n = n_embd * n_hc;
@@ -3535,6 +4216,140 @@ __global__ static void f32_to_f16_kernel(__half *out, const float *x, uint64_t n
     if (i < n) out[i] = __float2half(x[i]);
 }
 
+__global__ static void f16_to_f32_kernel(float *out, const __half *x, uint64_t n) {
+    uint64_t i = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) out[i] = __half2float(x[i]);
+}
+
+__global__ static void f32_rows_to_q8_kv_kernel(
+        char *dst,
+        const float *src,
+        uint32_t rows,
+        uint32_t head_dim,
+        uint64_t dst_row_bytes) {
+    uint32_t row = blockIdx.x;
+    if (row >= rows || head_dim == 0) return;
+    __shared__ float partial[256];
+    float local_max = 0.0f;
+    const float *src_row = src + (uint64_t)row * head_dim;
+    for (uint32_t d = threadIdx.x; d < head_dim; d += blockDim.x) {
+        local_max = fmaxf(local_max, fabsf(src_row[d]));
+    }
+    partial[threadIdx.x] = local_max;
+    __syncthreads();
+    for (uint32_t stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
+        if (threadIdx.x < stride) {
+            partial[threadIdx.x] = fmaxf(partial[threadIdx.x],
+                                         partial[threadIdx.x + stride]);
+        }
+        __syncthreads();
+    }
+    char *dst_row = dst + (uint64_t)row * dst_row_bytes;
+    float scale = partial[0] > 0.0f ? partial[0] / 127.0f : 1.0f;
+    if (threadIdx.x == 0) {
+        *((float *)dst_row) = scale;
+    }
+    __syncthreads();
+    int8_t *q = (int8_t *)(dst_row + sizeof(float));
+    const float inv_scale = 1.0f / scale;
+    for (uint32_t d = threadIdx.x; d < head_dim; d += blockDim.x) {
+        int v = __float2int_rn(src_row[d] * inv_scale);
+        if (v > 127) v = 127;
+        if (v < -127) v = -127;
+        q[d] = (int8_t)v;
+    }
+}
+
+__global__ static void q8_kv_to_f32_kernel(
+        float *out,
+        const char *src,
+        uint32_t rows,
+        uint32_t head_dim,
+        uint64_t src_row_bytes) {
+    uint64_t idx = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    uint64_t n = (uint64_t)rows * head_dim;
+    if (idx >= n || head_dim == 0) return;
+    uint32_t row = (uint32_t)(idx / head_dim);
+    uint32_t d = (uint32_t)(idx - (uint64_t)row * head_dim);
+    const char *src_row = src + (uint64_t)row * src_row_bytes;
+    const float scale = *((const float *)src_row);
+    const int8_t q = ((const int8_t *)(src_row + sizeof(float)))[d];
+    out[idx] = scale * (float)q;
+}
+
+static uint64_t cuda_comp_kv_row_bytes(uint32_t format, uint32_t head_dim) {
+    if (format == DS4_GPU_COMP_KV_FORMAT_F16) {
+        return (uint64_t)head_dim * sizeof(__half);
+    }
+    if (format == DS4_GPU_COMP_KV_FORMAT_Q8) {
+        return sizeof(float) + (uint64_t)head_dim * sizeof(int8_t);
+    }
+    return (uint64_t)head_dim * sizeof(float);
+}
+
+static ds4_gpu_tensor *cuda_comp_kv_to_f32_tensor(
+        const ds4_gpu_tensor *comp_kv,
+        uint32_t format,
+        uint32_t n_comp,
+        uint32_t head_dim,
+        const char *what) {
+    if (!comp_kv || n_comp == 0 || head_dim == 0) return NULL;
+    const uint64_t count = (uint64_t)n_comp * head_dim;
+    if (count / head_dim != (uint64_t)n_comp ||
+        count > UINT64_MAX / sizeof(float)) {
+        fprintf(stderr,
+                "ds4: CUDA compressed KV expansion overflow for %s\n",
+                what ? what : "attention");
+        return NULL;
+    }
+    const uint64_t src_row_bytes = cuda_comp_kv_row_bytes(format, head_dim);
+    if ((uint64_t)n_comp > UINT64_MAX / src_row_bytes) return NULL;
+    const uint64_t src_bytes = (uint64_t)n_comp * src_row_bytes;
+    const uint64_t dst_bytes = count * sizeof(float);
+    if (comp_kv->bytes < src_bytes) {
+        fprintf(stderr,
+                "ds4: CUDA compressed KV buffer too small for %s (%llu < %llu)\n",
+                what ? what : "attention",
+                (unsigned long long)comp_kv->bytes,
+                (unsigned long long)src_bytes);
+        return NULL;
+    }
+    ds4_gpu_tensor *f32 = ds4_gpu_tensor_alloc(dst_bytes);
+    if (!f32) return NULL;
+    if (format == DS4_GPU_COMP_KV_FORMAT_F16) {
+        f16_to_f32_kernel<<<(count + 255u) / 256u, 256>>>(
+                (float *)f32->ptr,
+                (const __half *)comp_kv->ptr,
+                count);
+    } else if (format == DS4_GPU_COMP_KV_FORMAT_Q8) {
+        q8_kv_to_f32_kernel<<<(count + 255u) / 256u, 256>>>(
+                (float *)f32->ptr,
+                (const char *)comp_kv->ptr,
+                n_comp,
+                head_dim,
+                src_row_bytes);
+    } else {
+        ds4_gpu_tensor_free(f32);
+        return NULL;
+    }
+    if (!cuda_ok(cudaGetLastError(),
+                 what ? what : "compressed KV to f32 launch")) {
+        ds4_gpu_tensor_free(f32);
+        return NULL;
+    }
+    if (getenv("DS4_CUDA_KV_CACHE_VERBOSE")) {
+        fprintf(stderr,
+                "ds4: CUDA expanded %s compressed KV for %s: rows=%u dim=%u bytes %.2f MiB -> %.2f MiB\n",
+                format == DS4_GPU_COMP_KV_FORMAT_Q8 ? "Q8" : "FP16",
+                what ? what : "attention",
+                n_comp,
+                head_dim,
+                (double)src_bytes / 1048576.0,
+                (double)dst_bytes / 1048576.0);
+    }
+    return f32;
+}
+
 __device__ static float warp_sum_f32(float v) {
     for (int offset = 16; offset > 0; offset >>= 1) {
         v += __shfl_down_sync(0xffffffffu, v, offset);
@@ -3551,6 +4366,52 @@ __device__ static float warp_max_f32(float v) {
 
 __device__ static float dot4_f32(float4 a, float4 b) {
     return a.x * b.x + a.y * b.y + a.z * b.z + a.w * b.w;
+}
+
+template <uint32_t COMP_FORMAT>
+__device__ __forceinline__ static float cuda_comp_kv_load_scalar(
+        const void *comp_kv,
+        uint64_t row,
+        uint32_t d,
+        uint32_t head_dim) {
+    if (COMP_FORMAT == DS4_GPU_COMP_KV_FORMAT_F16) {
+        return __half2float(((const __half *)comp_kv)[row * (uint64_t)head_dim + d]);
+    }
+    if (COMP_FORMAT == DS4_GPU_COMP_KV_FORMAT_Q8) {
+        const char *row_ptr = (const char *)comp_kv +
+            row * (sizeof(float) + (uint64_t)head_dim * sizeof(int8_t));
+        const float scale = *((const float *)row_ptr);
+        const int8_t q = ((const int8_t *)(row_ptr + sizeof(float)))[d];
+        return scale * (float)q;
+    }
+    return ((const float *)comp_kv)[row * (uint64_t)head_dim + d];
+}
+
+template <uint32_t COMP_FORMAT>
+__device__ __forceinline__ static float4 cuda_comp_kv_load4(
+        const void *comp_kv,
+        uint64_t row,
+        uint32_t c4,
+        uint32_t head_dim) {
+    const uint64_t base = row * (uint64_t)head_dim + (uint64_t)c4 * 4u;
+    if (COMP_FORMAT == DS4_GPU_COMP_KV_FORMAT_F16) {
+        const __half *h = (const __half *)comp_kv + base;
+        return make_float4(__half2float(h[0]),
+                           __half2float(h[1]),
+                           __half2float(h[2]),
+                           __half2float(h[3]));
+    }
+    if (COMP_FORMAT == DS4_GPU_COMP_KV_FORMAT_Q8) {
+        const char *row_ptr = (const char *)comp_kv +
+            row * (sizeof(float) + (uint64_t)head_dim * sizeof(int8_t));
+        const float scale = *((const float *)row_ptr);
+        const int8_t *q = (const int8_t *)(row_ptr + sizeof(float)) + (uint64_t)c4 * 4u;
+        return make_float4(scale * (float)q[0],
+                           scale * (float)q[1],
+                           scale * (float)q[2],
+                           scale * (float)q[3]);
+    }
+    return ((const float4 *)((const float *)comp_kv + row * (uint64_t)head_dim))[c4];
 }
 
 __device__ __forceinline__ static int32_t load_i8x4_i32_aligned(const int8_t *p) {
@@ -4795,12 +5656,13 @@ __global__ static void attention_decode_mixed_kernel(
     }
 }
 
+template <uint32_t COMP_FORMAT>
 __global__ static void attention_indexed_mixed_kernel(
         float *heads,
         const float *sinks,
         const float *q,
         const float *raw_kv,
-        const float *comp_kv,
+        const void *comp_kv,
         const int32_t *topk,
         uint32_t n_tokens,
         uint32_t pos0,
@@ -4889,9 +5751,17 @@ __global__ static void attention_indexed_mixed_kernel(
             if (row < n_score) {
                 const float *kvrow = row < raw_count
                     ? raw_kv + (uint64_t)raw_rows[row] * head_dim
-                    : comp_kv + (uint64_t)comp_rows[row - raw_count] * head_dim;
+                    : NULL;
                 float dot = 0.0f;
-                for (uint32_t d = qlane; d < head_dim; d += 8u) dot += qh[d] * kvrow[d];
+                if (row < raw_count) {
+                    for (uint32_t d = qlane; d < head_dim; d += 8u) dot += qh[d] * kvrow[d];
+                } else {
+                    const uint32_t comp_row = comp_rows[row - raw_count];
+                    for (uint32_t d = qlane; d < head_dim; d += 8u) {
+                        dot += qh[d] * cuda_comp_kv_load_scalar<COMP_FORMAT>(
+                                comp_kv, comp_row, d, head_dim);
+                    }
+                }
                 const uint32_t mask = 0xffu << (threadIdx.x & 24u);
                 for (uint32_t off = 4u; off > 0u; off >>= 1u) {
                     dot += __shfl_down_sync(mask, dot, off, 8);
@@ -4939,9 +5809,9 @@ __global__ static void attention_indexed_mixed_kernel(
         }
         for (uint32_t c = 0; c < comp_count; c++) {
             float s = scores[raw_count + c];
-            const float *kv = comp_kv + (uint64_t)comp_rows[c] * head_dim;
-            acc0 += kv[d0] * s;
-            acc1 += kv[d1] * s;
+            const uint32_t comp_row = comp_rows[c];
+            acc0 += cuda_comp_kv_load_scalar<COMP_FORMAT>(comp_kv, comp_row, d0, head_dim) * s;
+            acc1 += cuda_comp_kv_load_scalar<COMP_FORMAT>(comp_kv, comp_row, d1, head_dim) * s;
         }
         oh[d0] = acc0 / denom;
         oh[d1] = acc1 / denom;
@@ -4949,18 +5819,25 @@ __global__ static void attention_indexed_mixed_kernel(
         for (uint32_t d = threadIdx.x; d < head_dim; d += blockDim.x) {
             float acc = 0.0f;
             for (uint32_t r = 0; r < raw_count; r++) acc += raw_kv[(uint64_t)raw_rows[r] * head_dim + d] * scores[r];
-            for (uint32_t s = 0; s < comp_count; s++) acc += comp_kv[(uint64_t)comp_rows[s] * head_dim + d] * scores[raw_count + s];
+            for (uint32_t s = 0; s < comp_count; s++) {
+                acc += cuda_comp_kv_load_scalar<COMP_FORMAT>(
+                        comp_kv,
+                        comp_rows[s],
+                        d,
+                        head_dim) * scores[raw_count + s];
+            }
             oh[d] = acc / denom;
         }
     }
 }
 
+template <uint32_t COMP_FORMAT>
 __global__ static void attention_indexed_mixed_heads8_rb4_kernel(
         float *heads,
         const float *sinks,
         const float *q,
         const float *raw_kv,
-        const float *comp_kv,
+        const void *comp_kv,
         const int32_t *topk,
         uint32_t n_tokens,
         uint32_t pos0,
@@ -5050,10 +5927,13 @@ __global__ static void attention_indexed_mixed_heads8_rb4_kernel(
             const uint32_t rr = off >> 7u;
             const uint32_t c4 = off & 127u;
             const uint32_t sr = row0 + rr;
-            const float4 *src = sr < raw_count
-                ? (const float4 *)(raw_kv + (uint64_t)raw_rows[sr] * head_dim)
-                : (const float4 *)(comp_kv + (uint64_t)comp_rows[sr - raw_count] * head_dim);
-            kv_shared[off] = src[c4];
+            kv_shared[off] = sr < raw_count
+                ? ((const float4 *)(raw_kv + (uint64_t)raw_rows[sr] * head_dim))[c4]
+                : cuda_comp_kv_load4<COMP_FORMAT>(
+                        comp_kv,
+                        comp_rows[sr - raw_count],
+                        c4,
+                        head_dim);
         }
         __syncthreads();
         if (valid_head) {
@@ -5098,10 +5978,13 @@ __global__ static void attention_indexed_mixed_heads8_rb4_kernel(
             const uint32_t rr = off >> 7u;
             const uint32_t c4 = off & 127u;
             const uint32_t sr = row0 + rr;
-            const float4 *src = sr < raw_count
-                ? (const float4 *)(raw_kv + (uint64_t)raw_rows[sr] * head_dim)
-                : (const float4 *)(comp_kv + (uint64_t)comp_rows[sr - raw_count] * head_dim);
-            kv_shared[off] = src[c4];
+            kv_shared[off] = sr < raw_count
+                ? ((const float4 *)(raw_kv + (uint64_t)raw_rows[sr] * head_dim))[c4]
+                : cuda_comp_kv_load4<COMP_FORMAT>(
+                        comp_kv,
+                        comp_rows[sr - raw_count],
+                        c4,
+                        head_dim);
         }
         __syncthreads();
         if (valid_head) {
@@ -5130,13 +6013,13 @@ __global__ static void attention_indexed_mixed_heads8_rb4_kernel(
     }
 }
 
-template <uint32_t ROWS_PER_STAGE, uint32_t HEADS_PER_GROUP>
+template <uint32_t ROWS_PER_STAGE, uint32_t HEADS_PER_GROUP, uint32_t COMP_FORMAT>
 __global__ static void attention_indexed_mixed_heads8_online_kernel(
         float *heads,
         const float *sinks,
         const float *q,
         const float *raw_kv,
-        const float *comp_kv,
+        const void *comp_kv,
         const int32_t *topk,
         uint32_t n_tokens,
         uint32_t pos0,
@@ -5226,10 +6109,9 @@ __global__ static void attention_indexed_mixed_heads8_online_kernel(
             const uint32_t comp_idx = sr < raw_count
                 ? 0u
                 : (uint32_t)topk[(uint64_t)t * top_k + (sr - raw_count)];
-            const float4 *src = sr < raw_count
-                ? (const float4 *)(raw_kv + (uint64_t)raw_rows[sr] * head_dim)
-                : (const float4 *)(comp_kv + (uint64_t)comp_idx * head_dim);
-            kv_shared[off] = src[c4];
+            kv_shared[off] = sr < raw_count
+                ? ((const float4 *)(raw_kv + (uint64_t)raw_rows[sr] * head_dim))[c4]
+                : cuda_comp_kv_load4<COMP_FORMAT>(comp_kv, comp_idx, c4, head_dim);
         }
         __syncthreads();
         if (valid_head) {
@@ -8215,7 +9097,19 @@ extern "C" int ds4_gpu_attn_q_b_f16_head_rms_rope_tail_tensor(
 }
 
 extern "C" int ds4_gpu_dsv4_fp8_kv_quantize_tensor(ds4_gpu_tensor *x, uint32_t n_tok, uint32_t head_dim, uint32_t n_rot) {
-    if (!x || n_rot > head_dim || x->bytes < (uint64_t)n_tok * head_dim * sizeof(float)) return 0;
+    if (!x || n_rot > head_dim || x->bytes < (uint64_t)n_tok * head_dim * sizeof(float)) {
+        if (getenv("DS4_CUDA_KV_CACHE_VERBOSE")) {
+            fprintf(stderr,
+                    "ds4: CUDA fp8_kv_quantize validation failed x=%p n_tok=%u head_dim=%u n_rot=%u bytes=%llu need=%llu\n",
+                    (void *)x,
+                    n_tok,
+                    head_dim,
+                    n_rot,
+                    (unsigned long long)(x ? x->bytes : 0),
+                    (unsigned long long)((uint64_t)n_tok * head_dim * sizeof(float)));
+        }
+        return 0;
+    }
     fp8_kv_quantize_kernel<<<n_tok, 64>>>((float *)x->ptr, n_tok, head_dim, n_rot);
     return cuda_ok(cudaGetLastError(), "fp8_kv_quantize launch");
 }
@@ -8241,13 +9135,43 @@ extern "C" int ds4_gpu_kv_fp8_store_raw_tensor(
         uint32_t          raw_row,
         uint32_t          head_dim,
         uint32_t          n_rot) {
-    return ds4_gpu_dsv4_fp8_kv_quantize_tensor(kv, 1, head_dim, n_rot) &&
-           ds4_gpu_store_raw_kv_tensor(raw_cache, kv, raw_cap, raw_row, head_dim);
+    if ((getenv("DS4_CUDA_KV_CACHE_VERBOSE") ||
+         getenv("DS4_CUDA_KV_RAW_STORE_VERBOSE")) &&
+        g_fp8_raw_store_notice_count < 64) {
+        fprintf(stderr,
+                "ds4: CUDA fp8 raw KV store request kv=%p raw=%p raw_cap=%u raw_row=%u head_dim=%u n_rot=%u bytes(kv=%llu raw=%llu)\n",
+                (void *)kv,
+                (void *)raw_cache,
+                raw_cap,
+                raw_row,
+                head_dim,
+                n_rot,
+                (unsigned long long)(kv ? kv->bytes : 0),
+                (unsigned long long)(raw_cache ? raw_cache->bytes : 0));
+        g_fp8_raw_store_notice_count++;
+    }
+    if (!ds4_gpu_dsv4_fp8_kv_quantize_tensor(kv, 1, head_dim, n_rot)) return 0;
+    return ds4_gpu_store_raw_kv_tensor(raw_cache, kv, raw_cap, raw_row, head_dim);
 }
 extern "C" int ds4_gpu_store_raw_kv_tensor(ds4_gpu_tensor *raw_cache, const ds4_gpu_tensor *kv, uint32_t raw_cap, uint32_t row, uint32_t head_dim) {
     if (!raw_cache || !kv || raw_cap == 0 ||
         raw_cache->bytes < (uint64_t)raw_cap * head_dim * sizeof(float) ||
-        kv->bytes < (uint64_t)head_dim * sizeof(float)) return 0;
+        kv->bytes < (uint64_t)head_dim * sizeof(float)) {
+        if (getenv("DS4_CUDA_KV_CACHE_VERBOSE")) {
+            fprintf(stderr,
+                    "ds4: CUDA store_raw_kv validation failed raw=%p kv=%p raw_cap=%u row=%u head_dim=%u bytes(raw=%llu kv=%llu) need(raw=%llu kv=%llu)\n",
+                    (void *)raw_cache,
+                    (void *)kv,
+                    raw_cap,
+                    row,
+                    head_dim,
+                    (unsigned long long)(raw_cache ? raw_cache->bytes : 0),
+                    (unsigned long long)(kv ? kv->bytes : 0),
+                    (unsigned long long)((uint64_t)raw_cap * head_dim * sizeof(float)),
+                    (unsigned long long)((uint64_t)head_dim * sizeof(float)));
+        }
+        return 0;
+    }
     store_raw_kv_batch_kernel<<<(head_dim + 255) / 256, 256>>>((float *)raw_cache->ptr, (const float *)kv->ptr, raw_cap, row, 1, head_dim);
     return cuda_ok(cudaGetLastError(), "store_raw_kv launch");
 }
@@ -8651,21 +9575,33 @@ extern "C" int ds4_gpu_attention_decode_heads_tensor(
         uint32_t                use_mask,
         uint32_t                n_head,
         uint32_t                head_dim) {
-    if (comp_kv_f16 ||
-        !heads || !q || !raw_kv || !model_map || n_raw == 0 || raw_cap < n_raw ||
+    ds4_gpu_tensor *comp_kv_f32 = NULL;
+    const ds4_gpu_tensor *comp_arg = comp_kv;
+    if (n_comp == 0) comp_kv_f16 = 0;
+    if (comp_kv_f16 && n_comp != 0) {
+        comp_kv_f32 = cuda_comp_kv_to_f32_tensor(
+                comp_kv, comp_kv_f16, n_comp, head_dim, "attention decode");
+        if (!comp_kv_f32) return 0;
+        comp_arg = comp_kv_f32;
+        comp_kv_f16 = 0;
+    }
+    int ok = 0;
+    const float *sinks = NULL;
+    dim3 grid(1, 1, 1);
+    if (!heads || !q || !raw_kv || !model_map || n_raw == 0 || raw_cap < n_raw ||
         raw_start >= raw_cap || (n_comp != 0 && !comp_kv) || (use_mask && !comp_mask) ||
         sinks_offset > model_size ||
         (uint64_t)n_head * sizeof(float) > model_size - sinks_offset ||
         heads->bytes < (uint64_t)n_head * head_dim * sizeof(float) ||
         q->bytes < (uint64_t)n_head * head_dim * sizeof(float) ||
         raw_kv->bytes < (uint64_t)raw_cap * head_dim * sizeof(float) ||
-        (n_comp && comp_kv->bytes < (uint64_t)n_comp * head_dim * sizeof(float)) ||
+        (n_comp && comp_arg->bytes < (uint64_t)n_comp * head_dim * sizeof(float)) ||
         (use_mask && comp_mask->bytes < (uint64_t)n_comp * sizeof(float))) {
-        return 0;
+        goto done;
     }
-    const float *sinks = (const float *)cuda_model_range_ptr(
+    sinks = (const float *)cuda_model_range_ptr(
             model_map, sinks_offset, (uint64_t)n_head * sizeof(float), "attn_sinks");
-    if (!sinks) return 0;
+    if (!sinks) goto done;
     if (!cuda_attention_score_buffer_fits(n_comp)) {
         if (!use_mask && head_dim == 512u &&
             getenv("DS4_CUDA_NO_WINDOW_ATTENTION") == NULL) {
@@ -8674,7 +9610,7 @@ extern "C" int ds4_gpu_attention_decode_heads_tensor(
                                                                               sinks,
                                                                               (const float *)q->ptr,
                                                                               (const float *)raw_kv->ptr,
-                                                                              n_comp ? (const float *)comp_kv->ptr : (const float *)raw_kv->ptr,
+                                                                              n_comp ? (const float *)comp_arg->ptr : (const float *)raw_kv->ptr,
                                                                               1,
                                                                               0,
                                                                               n_raw,
@@ -8685,22 +9621,26 @@ extern "C" int ds4_gpu_attention_decode_heads_tensor(
                                                                               0,
                                                                               n_head,
                                                                               head_dim);
-            return cuda_ok(cudaGetLastError(), "attention decode online launch");
+            ok = cuda_ok(cudaGetLastError(), "attention decode online launch");
+            goto done;
         }
         fprintf(stderr, "ds4: CUDA attention score buffer too small for %u compressed rows\n", n_comp);
-        return 0;
+        goto done;
     }
-    dim3 grid(1, n_head, 1);
+    grid = dim3(1, n_head, 1);
     attention_decode_mixed_kernel<<<grid, 256>>>((float *)heads->ptr,
                                                  sinks,
                                                  (const float *)q->ptr,
                                                  (const float *)raw_kv->ptr,
-                                                 n_comp ? (const float *)comp_kv->ptr : (const float *)raw_kv->ptr,
+                                                 n_comp ? (const float *)comp_arg->ptr : (const float *)raw_kv->ptr,
                                                  use_mask ? (const float *)comp_mask->ptr : NULL,
                                                  use_mask,
                                                  1, 0, n_raw, raw_cap, raw_start, n_comp,
                                                  0, 0, n_head, head_dim);
-    return cuda_ok(cudaGetLastError(), "attention decode launch");
+    ok = cuda_ok(cudaGetLastError(), "attention decode launch");
+done:
+    ds4_gpu_tensor_free(comp_kv_f32);
+    return ok;
 }
 extern "C" int ds4_gpu_attention_prefill_raw_heads_tensor(ds4_gpu_tensor *heads, const void *model_map, uint64_t model_size, uint64_t sinks_offset, const ds4_gpu_tensor *q, const ds4_gpu_tensor *raw_kv, uint32_t n_tokens, uint32_t window, uint32_t n_head, uint32_t head_dim) {
     if (!heads || !q || !raw_kv || !model_map || sinks_offset > model_size ||
@@ -8833,6 +9773,35 @@ static int attention_decode_batch_launch(
         raw_kv->bytes < (uint64_t)raw_cap * head_dim * sizeof(float) ||
         (n_comp && comp_kv->bytes < (uint64_t)n_comp * head_dim * sizeof(float)) ||
         (use_comp_mask && comp_mask->bytes < (uint64_t)n_tokens * n_comp * sizeof(float))) {
+        if (getenv("DS4_CUDA_KV_CACHE_VERBOSE")) {
+            fprintf(stderr,
+                    "ds4: CUDA attention decode batch validation failed "
+                    "comp_f16=%u heads=%p q=%p raw=%p comp=%p mask=%p use_mask=%u "
+                    "n_tokens=%u pos0=%u n_raw=%u raw_cap=%u raw_start=%u n_comp=%u "
+                    "window=%u ratio=%u n_head=%u head_dim=%u bytes(heads=%llu q=%llu raw=%llu comp=%llu mask=%llu)\n",
+                    comp_kv_f16,
+                    (void *)heads,
+                    (void *)q,
+                    (void *)raw_kv,
+                    (void *)comp_kv,
+                    (void *)comp_mask,
+                    use_comp_mask,
+                    n_tokens,
+                    pos0,
+                    n_raw,
+                    raw_cap,
+                    raw_start,
+                    n_comp,
+                    window,
+                    ratio,
+                    n_head,
+                    head_dim,
+                    (unsigned long long)(heads ? heads->bytes : 0),
+                    (unsigned long long)(q ? q->bytes : 0),
+                    (unsigned long long)(raw_kv ? raw_kv->bytes : 0),
+                    (unsigned long long)(comp_kv ? comp_kv->bytes : 0),
+                    (unsigned long long)(comp_mask ? comp_mask->bytes : 0));
+        }
         return 0;
     }
     if (n_comp != 0 && ratio == 0) return 0;
@@ -8938,11 +9907,21 @@ extern "C" int ds4_gpu_attention_decode_mixed_batch_heads_tensor(
         uint32_t                ratio,
         uint32_t                n_head,
         uint32_t                head_dim) {
-    if (comp_kv_f16) return 0;
-    return attention_decode_batch_launch(heads, model_map, model_size, sinks_offset,
-                                      q, raw_kv, comp_kv, comp_kv_f16, comp_mask, use_comp_mask,
-                                      n_tokens, pos0, n_raw, raw_cap, raw_start,
-                                      n_comp, window, ratio, n_head, head_dim);
+    ds4_gpu_tensor *comp_kv_f32 = NULL;
+    const ds4_gpu_tensor *comp_arg = comp_kv;
+    if (comp_kv_f16 && n_comp != 0) {
+        comp_kv_f32 = cuda_comp_kv_to_f32_tensor(
+                comp_kv, comp_kv_f16, n_comp, head_dim, "attention decode batch");
+        if (!comp_kv_f32) return 0;
+        comp_arg = comp_kv_f32;
+        comp_kv_f16 = 0;
+    }
+    const int ok = attention_decode_batch_launch(heads, model_map, model_size, sinks_offset,
+                                                 q, raw_kv, comp_arg, comp_kv_f16, comp_mask, use_comp_mask,
+                                                 n_tokens, pos0, n_raw, raw_cap, raw_start,
+                                                 n_comp, window, ratio, n_head, head_dim);
+    ds4_gpu_tensor_free(comp_kv_f32);
+    return ok;
 }
 
 extern "C" int ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
@@ -8966,8 +9945,22 @@ extern "C" int ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
         uint32_t                ratio,
         uint32_t                n_head,
         uint32_t                head_dim) {
-    if (comp_kv_f16 ||
-        !heads || !q || !raw_kv || !comp_kv || !topk || !model_map ||
+    const ds4_gpu_tensor *comp_arg = comp_kv;
+    int ok = 0;
+    const float *sinks = NULL;
+    const int32_t *topk_ptr = NULL;
+    dim3 grid(1, 1, 1);
+    int use_heads8 = 0;
+    int use_twopass = 0;
+    int log_this_call = 0;
+    const uint32_t comp_kv_format = comp_kv_f16;
+    const uint64_t comp_row_bytes = cuda_comp_kv_row_bytes(comp_kv_format, head_dim);
+    const int verbose = getenv("DS4_CUDA_KV_CACHE_VERBOSE") != NULL;
+    const int sync_indexed = getenv("DS4_CUDA_INDEXED_SYNC") != NULL;
+    if ((comp_kv_format != DS4_GPU_COMP_KV_FORMAT_F32 &&
+         comp_kv_format != DS4_GPU_COMP_KV_FORMAT_F16 &&
+         comp_kv_format != DS4_GPU_COMP_KV_FORMAT_Q8) ||
+        !heads || !q || !raw_kv || !comp_arg || !topk || !model_map ||
         n_tokens == 0 || n_raw == 0 || raw_cap < n_raw || raw_start >= raw_cap ||
         n_comp == 0 || top_k == 0 ||
         sinks_offset > model_size ||
@@ -8975,86 +9968,332 @@ extern "C" int ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
         heads->bytes < (uint64_t)n_tokens * n_head * head_dim * sizeof(float) ||
         q->bytes < (uint64_t)n_tokens * n_head * head_dim * sizeof(float) ||
         raw_kv->bytes < (uint64_t)raw_cap * head_dim * sizeof(float) ||
-        comp_kv->bytes < (uint64_t)n_comp * head_dim * sizeof(float) ||
+        comp_arg->bytes < (uint64_t)n_comp * comp_row_bytes ||
         topk->bytes < (uint64_t)n_tokens * top_k * sizeof(int32_t)) {
-        return 0;
+        if (verbose) {
+            fprintf(stderr,
+                    "ds4: CUDA indexed attention validation failed "
+                    "comp_format=%u heads=%p q=%p raw=%p comp=%p topk=%p "
+                    "n_tokens=%u pos0=%u n_raw=%u raw_cap=%u raw_start=%u "
+                    "n_comp=%u top_k=%u window=%u ratio=%u n_head=%u head_dim=%u "
+                    "bytes(heads=%llu q=%llu raw=%llu comp=%llu topk=%llu row=%llu)\n",
+                    comp_kv_format,
+                    (void *)heads,
+                    (void *)q,
+                    (void *)raw_kv,
+                    (void *)comp_arg,
+                    (void *)topk,
+                    n_tokens,
+                    pos0,
+                    n_raw,
+                    raw_cap,
+                    raw_start,
+                    n_comp,
+                    top_k,
+                    window,
+                    ratio,
+                    n_head,
+                    head_dim,
+                    (unsigned long long)(heads ? heads->bytes : 0),
+                    (unsigned long long)(q ? q->bytes : 0),
+                    (unsigned long long)(raw_kv ? raw_kv->bytes : 0),
+                    (unsigned long long)(comp_arg ? comp_arg->bytes : 0),
+                    (unsigned long long)(topk ? topk->bytes : 0),
+                    (unsigned long long)comp_row_bytes);
+        }
+        goto done;
     }
-    if (top_k > 512u) return 0;
-    const float *sinks = (const float *)cuda_model_range_ptr(
+    if (top_k > 512u) goto done;
+    sinks = (const float *)cuda_model_range_ptr(
             model_map, sinks_offset, (uint64_t)n_head * sizeof(float), "attn_sinks");
-    if (!sinks) return 0;
-    const int32_t *topk_ptr = (const int32_t *)topk->ptr;
+    if (!sinks) goto done;
+    if (comp_kv_format != DS4_GPU_COMP_KV_FORMAT_F32 &&
+        verbose &&
+        !g_indexed_f16_kv_notice_printed) {
+        fprintf(stderr,
+                "ds4: CUDA indexed attention using direct %s compressed KV rows (n_comp=%u top_k=%u n_tokens=%u head_dim=%u row_bytes=%llu)\n",
+                comp_kv_format == DS4_GPU_COMP_KV_FORMAT_Q8 ? "Q8" : "FP16",
+                n_comp,
+                top_k,
+                n_tokens,
+                head_dim,
+                (unsigned long long)comp_row_bytes);
+        g_indexed_f16_kv_notice_printed = 1;
+    }
+    topk_ptr = (const int32_t *)topk->ptr;
     if (n_tokens > 1u && top_k == 512u &&
         getenv("DS4_CUDA_NO_INDEXED_TOPK_SORT") == NULL) {
         const uint64_t sort_bytes = (uint64_t)n_tokens * top_k * sizeof(int32_t);
         int32_t *sorted = (int32_t *)cuda_tmp_alloc(sort_bytes, "indexed attention topk sort");
-        if (!sorted) return 0;
+        if (!sorted) goto done;
         indexed_topk_sort_512_asc_kernel<<<n_tokens, 512>>>(sorted, topk_ptr, n_tokens);
-        if (!cuda_ok(cudaGetLastError(), "indexed attention topk sort launch")) return 0;
+        if (!cuda_ok(cudaGetLastError(), "indexed attention topk sort launch")) goto done;
         topk_ptr = sorted;
     }
-    if (n_tokens > 1 && head_dim == 512 && top_k <= 512u &&
-        getenv("DS4_CUDA_NO_INDEXED_HEADS8") == NULL) {
+    use_heads8 =
+        n_tokens > 1u && head_dim == 512u && top_k <= 512u &&
+        getenv("DS4_CUDA_NO_INDEXED_HEADS8") == NULL;
+    use_twopass = getenv("DS4_CUDA_INDEXED_TWOPASS") != NULL;
+    log_this_call = verbose && g_indexed_attention_plan_notice_count < 128;
+    if (log_this_call) {
+        fprintf(stderr,
+                "ds4: CUDA indexed attention launch plan kernel=%s comp_format=%u sync=%u "
+                "n_tokens=%u pos0=%u n_raw=%u raw_cap=%u raw_start=%u n_comp=%u "
+                "top_k=%u window=%u ratio=%u n_head=%u head_dim=%u bytes(comp=%llu topk=%llu)\n",
+                use_heads8 ? (use_twopass ? "heads8-rb4" : "heads8-online") : "mixed",
+                comp_kv_format,
+                sync_indexed,
+                n_tokens,
+                pos0,
+                n_raw,
+                raw_cap,
+                raw_start,
+                n_comp,
+                top_k,
+                window,
+                ratio,
+                n_head,
+                head_dim,
+                (unsigned long long)comp_arg->bytes,
+                (unsigned long long)topk->bytes);
+        g_indexed_attention_plan_notice_count++;
+    }
+    if (use_heads8) {
         if (getenv("DS4_CUDA_INDEXED_TWOPASS") == NULL) {
             dim3 grid(n_tokens, (n_head + 15u) / 16u, 1);
-            attention_indexed_mixed_heads8_online_kernel<8, 16><<<grid, 512>>>((float *)heads->ptr,
-                                                                               sinks,
-                                                                               (const float *)q->ptr,
-                                                                               (const float *)raw_kv->ptr,
-                                                                               (const float *)comp_kv->ptr,
-                                                                               topk_ptr,
-                                                                               n_tokens,
-                                                                               pos0,
-                                                                               n_raw,
-                                                                               raw_cap,
-                                                                               raw_start,
-                                                                               n_comp,
-                                                                               top_k,
-                                                                               window,
-                                                                               ratio,
-                                                                               n_head,
-                                                                               head_dim);
-            return cuda_ok(cudaGetLastError(), "attention indexed online launch");
+            if (comp_kv_format == DS4_GPU_COMP_KV_FORMAT_Q8) {
+                attention_indexed_mixed_heads8_online_kernel<8, 16, DS4_GPU_COMP_KV_FORMAT_Q8><<<grid, 512>>>((float *)heads->ptr,
+                                                                                                               sinks,
+                                                                                                               (const float *)q->ptr,
+                                                                                                               (const float *)raw_kv->ptr,
+                                                                                                               comp_arg->ptr,
+                                                                                                               topk_ptr,
+                                                                                                               n_tokens,
+                                                                                                               pos0,
+                                                                                                               n_raw,
+                                                                                                               raw_cap,
+                                                                                                               raw_start,
+                                                                                                               n_comp,
+                                                                                                               top_k,
+                                                                                                               window,
+                                                                                                               ratio,
+                                                                                                               n_head,
+                                                                                                               head_dim);
+            } else if (comp_kv_format == DS4_GPU_COMP_KV_FORMAT_F16) {
+                attention_indexed_mixed_heads8_online_kernel<8, 16, DS4_GPU_COMP_KV_FORMAT_F16><<<grid, 512>>>((float *)heads->ptr,
+                                                                                                                sinks,
+                                                                                                                (const float *)q->ptr,
+                                                                                                                (const float *)raw_kv->ptr,
+                                                                                                                comp_arg->ptr,
+                                                                                                                topk_ptr,
+                                                                                                                n_tokens,
+                                                                                                                pos0,
+                                                                                                                n_raw,
+                                                                                                                raw_cap,
+                                                                                                                raw_start,
+                                                                                                                n_comp,
+                                                                                                                top_k,
+                                                                                                                window,
+                                                                                                                ratio,
+                                                                                                                n_head,
+                                                                                                                head_dim);
+            } else {
+                attention_indexed_mixed_heads8_online_kernel<8, 16, DS4_GPU_COMP_KV_FORMAT_F32><<<grid, 512>>>((float *)heads->ptr,
+                                                                                                                sinks,
+                                                                                                                (const float *)q->ptr,
+                                                                                                                (const float *)raw_kv->ptr,
+                                                                                                                comp_arg->ptr,
+                                                                                                                topk_ptr,
+                                                                                                                n_tokens,
+                                                                                                                pos0,
+                                                                                                                n_raw,
+                                                                                                                raw_cap,
+                                                                                                                raw_start,
+                                                                                                                n_comp,
+                                                                                                                top_k,
+                                                                                                                window,
+                                                                                                                ratio,
+                                                                                                                n_head,
+                                                                                                                head_dim);
+            }
+            {
+                cudaError_t err = cudaGetLastError();
+                ok = cuda_ok(err, "attention indexed online launch");
+                if (log_this_call) {
+                    fprintf(stderr,
+                            "ds4: CUDA indexed attention launch result kernel=heads8-online ok=%d err=%s\n",
+                            ok,
+                            cudaGetErrorString(err));
+                }
+                if (ok && sync_indexed) {
+                    err = cudaDeviceSynchronize();
+                    ok = cuda_ok(err, "attention indexed online sync");
+                    if (log_this_call) {
+                        fprintf(stderr,
+                                "ds4: CUDA indexed attention sync result kernel=heads8-online ok=%d err=%s\n",
+                                ok,
+                                cudaGetErrorString(err));
+                    }
+                }
+            }
+            goto done;
         }
         dim3 grid(n_tokens, (n_head + 7u) / 8u, 1);
-        attention_indexed_mixed_heads8_rb4_kernel<<<grid, 256>>>((float *)heads->ptr,
-                                                                 sinks,
-                                                                 (const float *)q->ptr,
-                                                                 (const float *)raw_kv->ptr,
-                                                                 (const float *)comp_kv->ptr,
-                                                                 topk_ptr,
-                                                                 n_tokens,
-                                                                 pos0,
-                                                                 n_raw,
-                                                                 raw_cap,
-                                                                 raw_start,
-                                                                 n_comp,
-                                                                 top_k,
-                                                                 window,
-                                                                 ratio,
-                                                                 n_head,
-                                                                 head_dim);
-        return cuda_ok(cudaGetLastError(), "attention indexed heads8 launch");
+        if (comp_kv_format == DS4_GPU_COMP_KV_FORMAT_Q8) {
+            attention_indexed_mixed_heads8_rb4_kernel<DS4_GPU_COMP_KV_FORMAT_Q8><<<grid, 256>>>((float *)heads->ptr,
+                                                                                                sinks,
+                                                                                                (const float *)q->ptr,
+                                                                                                (const float *)raw_kv->ptr,
+                                                                                                comp_arg->ptr,
+                                                                                                topk_ptr,
+                                                                                                n_tokens,
+                                                                                                pos0,
+                                                                                                n_raw,
+                                                                                                raw_cap,
+                                                                                                raw_start,
+                                                                                                n_comp,
+                                                                                                top_k,
+                                                                                                window,
+                                                                                                ratio,
+                                                                                                n_head,
+                                                                                                head_dim);
+        } else if (comp_kv_format == DS4_GPU_COMP_KV_FORMAT_F16) {
+            attention_indexed_mixed_heads8_rb4_kernel<DS4_GPU_COMP_KV_FORMAT_F16><<<grid, 256>>>((float *)heads->ptr,
+                                                                                                 sinks,
+                                                                                                 (const float *)q->ptr,
+                                                                                                 (const float *)raw_kv->ptr,
+                                                                                                 comp_arg->ptr,
+                                                                                                 topk_ptr,
+                                                                                                 n_tokens,
+                                                                                                 pos0,
+                                                                                                 n_raw,
+                                                                                                 raw_cap,
+                                                                                                 raw_start,
+                                                                                                 n_comp,
+                                                                                                 top_k,
+                                                                                                 window,
+                                                                                                 ratio,
+                                                                                                 n_head,
+                                                                                                 head_dim);
+        } else {
+            attention_indexed_mixed_heads8_rb4_kernel<DS4_GPU_COMP_KV_FORMAT_F32><<<grid, 256>>>((float *)heads->ptr,
+                                                                                                 sinks,
+                                                                                                 (const float *)q->ptr,
+                                                                                                 (const float *)raw_kv->ptr,
+                                                                                                 comp_arg->ptr,
+                                                                                                 topk_ptr,
+                                                                                                 n_tokens,
+                                                                                                 pos0,
+                                                                                                 n_raw,
+                                                                                                 raw_cap,
+                                                                                                 raw_start,
+                                                                                                 n_comp,
+                                                                                                 top_k,
+                                                                                                 window,
+                                                                                                 ratio,
+                                                                                                 n_head,
+                                                                                                 head_dim);
+        }
+        {
+            cudaError_t err = cudaGetLastError();
+            ok = cuda_ok(err, "attention indexed heads8 launch");
+            if (log_this_call) {
+                fprintf(stderr,
+                        "ds4: CUDA indexed attention launch result kernel=heads8-rb4 ok=%d err=%s\n",
+                        ok,
+                        cudaGetErrorString(err));
+            }
+            if (ok && sync_indexed) {
+                err = cudaDeviceSynchronize();
+                ok = cuda_ok(err, "attention indexed heads8 sync");
+                if (log_this_call) {
+                    fprintf(stderr,
+                            "ds4: CUDA indexed attention sync result kernel=heads8-rb4 ok=%d err=%s\n",
+                            ok,
+                            cudaGetErrorString(err));
+                }
+            }
+        }
+        goto done;
     }
-    dim3 grid(n_tokens, n_head, 1);
-    attention_indexed_mixed_kernel<<<grid, 256>>>((float *)heads->ptr,
-                                                  sinks,
-                                                  (const float *)q->ptr,
-                                                  (const float *)raw_kv->ptr,
-                                                  (const float *)comp_kv->ptr,
-                                                  topk_ptr,
-                                                  n_tokens,
-                                                  pos0,
-                                                  n_raw,
-                                                  raw_cap,
-                                                  raw_start,
-                                                  n_comp,
-                                                  top_k,
-                                                  window,
-                                                  ratio,
-                                                  n_head,
-                                                  head_dim);
-    return cuda_ok(cudaGetLastError(), "attention indexed mixed launch");
+    grid = dim3(n_tokens, n_head, 1);
+    if (comp_kv_format == DS4_GPU_COMP_KV_FORMAT_Q8) {
+        attention_indexed_mixed_kernel<DS4_GPU_COMP_KV_FORMAT_Q8><<<grid, 256>>>((float *)heads->ptr,
+                                                                                 sinks,
+                                                                                 (const float *)q->ptr,
+                                                                                 (const float *)raw_kv->ptr,
+                                                                                 comp_arg->ptr,
+                                                                                 topk_ptr,
+                                                                                 n_tokens,
+                                                                                 pos0,
+                                                                                 n_raw,
+                                                                                 raw_cap,
+                                                                                 raw_start,
+                                                                                 n_comp,
+                                                                                 top_k,
+                                                                                 window,
+                                                                                 ratio,
+                                                                                 n_head,
+                                                                                 head_dim);
+    } else if (comp_kv_format == DS4_GPU_COMP_KV_FORMAT_F16) {
+        attention_indexed_mixed_kernel<DS4_GPU_COMP_KV_FORMAT_F16><<<grid, 256>>>((float *)heads->ptr,
+                                                                                  sinks,
+                                                                                  (const float *)q->ptr,
+                                                                                  (const float *)raw_kv->ptr,
+                                                                                  comp_arg->ptr,
+                                                                                  topk_ptr,
+                                                                                  n_tokens,
+                                                                                  pos0,
+                                                                                  n_raw,
+                                                                                  raw_cap,
+                                                                                  raw_start,
+                                                                                  n_comp,
+                                                                                  top_k,
+                                                                                  window,
+                                                                                  ratio,
+                                                                                  n_head,
+                                                                                  head_dim);
+    } else {
+        attention_indexed_mixed_kernel<DS4_GPU_COMP_KV_FORMAT_F32><<<grid, 256>>>((float *)heads->ptr,
+                                                                                  sinks,
+                                                                                  (const float *)q->ptr,
+                                                                                  (const float *)raw_kv->ptr,
+                                                                                  comp_arg->ptr,
+                                                                                  topk_ptr,
+                                                                                  n_tokens,
+                                                                                  pos0,
+                                                                                  n_raw,
+                                                                                  raw_cap,
+                                                                                  raw_start,
+                                                                                  n_comp,
+                                                                                  top_k,
+                                                                                  window,
+                                                                                  ratio,
+                                                                                  n_head,
+                                                                                  head_dim);
+    }
+    {
+        cudaError_t err = cudaGetLastError();
+        ok = cuda_ok(err, "attention indexed mixed launch");
+        if (log_this_call) {
+            fprintf(stderr,
+                    "ds4: CUDA indexed attention launch result kernel=mixed ok=%d err=%s\n",
+                    ok,
+                    cudaGetErrorString(err));
+        }
+        if (ok && sync_indexed) {
+            err = cudaDeviceSynchronize();
+            ok = cuda_ok(err, "attention indexed mixed sync");
+            if (log_this_call) {
+                fprintf(stderr,
+                        "ds4: CUDA indexed attention sync result kernel=mixed ok=%d err=%s\n",
+                        ok,
+                        cudaGetErrorString(err));
+            }
+        }
+    }
+done:
+    return ok;
 }
 
 static int attention_prefill_mixed_launch(
@@ -9216,10 +10455,19 @@ extern "C" int ds4_gpu_attention_prefill_static_mixed_heads_tensor(
         uint32_t                ratio,
         uint32_t                n_head,
         uint32_t                head_dim) {
-    if (comp_kv_f16) return 0;
-    return attention_prefill_mixed_launch(heads, model_map, model_size, sinks_offset,
-                                       q, raw_kv, comp_kv, NULL, 0, n_tokens,
-                                       n_comp, window, ratio, n_head, head_dim);
+    ds4_gpu_tensor *comp_kv_f32 = NULL;
+    const ds4_gpu_tensor *comp_arg = comp_kv;
+    if (comp_kv_f16 && n_comp != 0) {
+        comp_kv_f32 = cuda_comp_kv_to_f32_tensor(
+                comp_kv, comp_kv_f16, n_comp, head_dim, "attention prefill");
+        if (!comp_kv_f32) return 0;
+        comp_arg = comp_kv_f32;
+    }
+    const int ok = attention_prefill_mixed_launch(heads, model_map, model_size, sinks_offset,
+                                                  q, raw_kv, comp_arg, NULL, 0, n_tokens,
+                                                  n_comp, window, ratio, n_head, head_dim);
+    ds4_gpu_tensor_free(comp_kv_f32);
+    return ok;
 }
 
 extern "C" int ds4_gpu_attention_prefill_masked_mixed_heads_tensor(
@@ -9238,10 +10486,19 @@ extern "C" int ds4_gpu_attention_prefill_masked_mixed_heads_tensor(
         uint32_t                ratio,
         uint32_t                n_head,
         uint32_t                head_dim) {
-    if (comp_kv_f16) return 0;
-    return attention_prefill_mixed_launch(heads, model_map, model_size, sinks_offset,
-                                       q, raw_kv, comp_kv, comp_mask, 1, n_tokens,
-                                       n_comp, window, ratio, n_head, head_dim);
+    ds4_gpu_tensor *comp_kv_f32 = NULL;
+    const ds4_gpu_tensor *comp_arg = comp_kv;
+    if (comp_kv_f16 && n_comp != 0) {
+        comp_kv_f32 = cuda_comp_kv_to_f32_tensor(
+                comp_kv, comp_kv_f16, n_comp, head_dim, "attention masked prefill");
+        if (!comp_kv_f32) return 0;
+        comp_arg = comp_kv_f32;
+    }
+    const int ok = attention_prefill_mixed_launch(heads, model_map, model_size, sinks_offset,
+                                                  q, raw_kv, comp_arg, comp_mask, 1, n_tokens,
+                                                  n_comp, window, ratio, n_head, head_dim);
+    ds4_gpu_tensor_free(comp_kv_f32);
+    return ok;
 }
 extern "C" int ds4_gpu_attention_output_q8_batch_tensor(
         ds4_gpu_tensor       *out,

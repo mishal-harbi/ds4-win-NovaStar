@@ -23,7 +23,11 @@
 #include <string.h>
 #include <stdarg.h>
 #include <time.h>
+#if defined(_WIN32)
+#include "ds4_win32.h"
+#else
 #include <unistd.h>
+#endif
 
 typedef struct {
     const char *prompt;
@@ -1491,6 +1495,19 @@ static cli_config parse_options(int argc, char **argv) {
             }
             c.engine.ssd_streaming_cache_experts = experts;
             c.engine.ssd_streaming_cache_bytes = bytes;
+        } else if (!strcmp(arg, "--ram-streaming-cache-experts")) {
+            uint32_t experts = 0;
+            uint64_t bytes = 0;
+            if (!ds4_parse_streaming_cache_experts_arg(
+                    need_arg(&i, argc, argv, arg), &experts, &bytes)) {
+                fprintf(stderr,
+                        "ds4: --ram-streaming-cache-experts must be a positive count or <number>GB\n");
+                exit(2);
+            }
+            c.engine.ram_streaming_cache_experts = experts;
+            c.engine.ram_streaming_cache_bytes = bytes;
+        } else if (!strcmp(arg, "--ram-streaming-cache-preload")) {
+            c.engine.ram_streaming_cache_preload = true;
         } else if (!strcmp(arg, "--ssd-streaming-preload-experts")) {
             int v = parse_int(need_arg(&i, argc, argv, arg), arg);
             if (v <= 0) {
@@ -1635,6 +1652,9 @@ static cli_config parse_options(int argc, char **argv) {
 }
 
 int main(int argc, char **argv) {
+#if defined(_WIN32)
+    ds4_win32_enable_utf8_console();
+#endif
     cli_config cfg = parse_options(argc, argv);
     if (cfg.gen.dump_tokens) {
         if (cfg.gen.prompt == NULL) {

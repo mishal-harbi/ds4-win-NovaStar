@@ -10,17 +10,21 @@
  * still live with the protocol code that owns those mappings. */
 
 #include <ctype.h>
-#include <dirent.h>
 #include <errno.h>
 #include <math.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#if defined(_WIN32)
+#include "ds4_win32.h"
+#else
+#include <dirent.h>
+#include <unistd.h>
+#endif
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <time.h>
-#include <unistd.h>
 
 #define KV_CACHE_MAGIC0 'K'
 #define KV_CACHE_MAGIC1 'V'

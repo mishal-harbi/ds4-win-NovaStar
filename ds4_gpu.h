@@ -37,6 +37,14 @@ int ds4_gpu_tensor_copy(ds4_gpu_tensor *dst, uint64_t dst_offset,
 int ds4_gpu_tensor_copy_f32_to_f16(ds4_gpu_tensor *dst, uint64_t dst_offset,
                                    const ds4_gpu_tensor *src, uint64_t src_offset,
                                    uint64_t count);
+int ds4_gpu_tensor_copy_f32_to_q8_kv(ds4_gpu_tensor *dst, uint64_t dst_offset,
+                                     const ds4_gpu_tensor *src, uint64_t src_offset,
+                                     uint32_t rows, uint32_t head_dim,
+                                     uint64_t dst_row_bytes);
+
+#define DS4_GPU_COMP_KV_FORMAT_F32 0u
+#define DS4_GPU_COMP_KV_FORMAT_F16 1u
+#define DS4_GPU_COMP_KV_FORMAT_Q8  2u
 
 int ds4_gpu_begin_commands(void);
 int ds4_gpu_flush_commands(void);
@@ -74,9 +82,12 @@ void ds4_gpu_set_quality(bool quality);
 void ds4_gpu_set_ssd_streaming(bool enabled);
 void ds4_gpu_set_streaming_expert_cache_budget(uint32_t experts);
 void ds4_gpu_set_streaming_expert_cache_expert_bytes(uint64_t bytes);
+void ds4_gpu_set_streaming_host_expert_cache_budget(uint32_t experts);
 uint64_t ds4_gpu_recommended_working_set_size(void);
 uint32_t ds4_gpu_stream_expert_cache_configured_count(void);
 uint32_t ds4_gpu_stream_expert_cache_current_count(void);
+uint32_t ds4_gpu_stream_host_expert_cache_configured_count(void);
+uint32_t ds4_gpu_stream_host_expert_cache_current_count(void);
 typedef struct ds4_gpu_stream_expert_table {
     const void *model_map;
     uint64_t    model_size;
@@ -125,6 +136,10 @@ int ds4_gpu_stream_expert_cache_seed_experts(
         const ds4_gpu_stream_expert_table *table,
         const int32_t                     *expert_ids,
         const uint32_t                    *expert_priorities,
+        uint32_t                           n_experts);
+int ds4_gpu_stream_host_expert_cache_seed_experts(
+        const ds4_gpu_stream_expert_table *table,
+        const int32_t                     *expert_ids,
         uint32_t                           n_experts);
 void ds4_gpu_print_memory_report(const char *label);
 

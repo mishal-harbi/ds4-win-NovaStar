@@ -2956,6 +2956,28 @@ void ds4_gpu_set_streaming_expert_cache_budget(uint32_t experts) {
     ds4_gpu_stream_expert_cache_clear_all(1);
 }
 
+void ds4_gpu_set_streaming_host_expert_cache_budget(uint32_t experts) {
+    (void)experts;
+}
+
+uint32_t ds4_gpu_stream_host_expert_cache_configured_count(void) {
+    return 0;
+}
+
+uint32_t ds4_gpu_stream_host_expert_cache_current_count(void) {
+    return 0;
+}
+
+int ds4_gpu_stream_host_expert_cache_seed_experts(
+        const ds4_gpu_stream_expert_table *table,
+        const int32_t                     *expert_ids,
+        uint32_t                           n_experts) {
+    (void)table;
+    (void)expert_ids;
+    (void)n_experts;
+    return 1;
+}
+
 void ds4_gpu_set_streaming_expert_cache_expert_bytes(uint64_t bytes) {
     /*
      * Pre-seed the cache's single slab size class with the model's uniform

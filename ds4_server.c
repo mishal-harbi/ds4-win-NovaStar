@@ -13,17 +13,25 @@
  * batching decisions in one place instead of spreading graph mutations across
  * client threads. */
 
-#include <arpa/inet.h>
 #include <ctype.h>
-#include <dirent.h>
 #include <errno.h>
 #include <float.h>
 #include <fcntl.h>
 #include <limits.h>
 #include <math.h>
+#if defined(_WIN32)
+#include "ds4_win32.h"
+#else
+#include <arpa/inet.h>
+#include <dirent.h>
 #include <netinet/in.h>
 #include <poll.h>
 #include <pthread.h>
+#include <strings.h>
+#include <sys/socket.h>
+#include <sys/time.h>
+#include <unistd.h>
+#endif
 #include <signal.h>
 #include <stdbool.h>
 #include <stdint.h>
@@ -31,13 +39,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <strings.h>
-#include <sys/socket.h>
 #include <sys/stat.h>
-#include <sys/time.h>
 #include <sys/types.h>
 #include <time.h>
-#include <unistd.h>
 
 static volatile sig_atomic_t g_stop_requested = 0;
 static volatile sig_atomic_t g_listen_fd = -1;
@@ -87,6 +91,26 @@ static char *xstrdup(const char *s) {
 }
 
 static bool random_bytes(void *dst, size_t len) {
+#if defined(_WIN32)
+    typedef BOOLEAN (APIENTRY *rtl_gen_random_fn)(PVOID, ULONG);
+    HMODULE advapi = LoadLibraryA("advapi32.dll");
+    if (!advapi) return false;
+    rtl_gen_random_fn rtl_gen_random =
+        (rtl_gen_random_fn)GetProcAddress(advapi, "SystemFunction036");
+    bool ok = false;
+    if (rtl_gen_random) {
+        unsigned char *p = dst;
+        while (len) {
+            ULONG chunk = len > 0xffffffffu ? 0xffffffffu : (ULONG)len;
+            if (!rtl_gen_random(p, chunk)) break;
+            p += chunk;
+            len -= chunk;
+        }
+        ok = len == 0;
+    }
+    FreeLibrary(advapi);
+    return ok;
+#else
     unsigned char *p = dst;
     int fd = open("/dev/urandom", O_RDONLY);
     if (fd < 0) return false;
@@ -102,6 +126,7 @@ static bool random_bytes(void *dst, size_t len) {
     }
     close(fd);
     return true;
+#endif
 }
 
 static char *xstrndup(const char *s, size_t n) {
@@ -11694,6 +11719,9 @@ static server_config parse_options(int argc, char **argv) {
 
 #ifndef DS4_SERVER_TEST
 int main(int argc, char **argv) {
+#if defined(_WIN32)
+    ds4_win32_enable_utf8_console();
+#endif
     signal(SIGPIPE, SIG_IGN);
     struct sigaction sa;
     memset(&sa, 0, sizeof(sa));

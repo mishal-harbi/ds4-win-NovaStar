@@ -1,0 +1,83 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1040" height="600" viewBox="0 0 1040 600" role="img" aria-labelledby="title desc">
+  <title id="title">FP16 vs Q8 compressed KV cache memory comparison</title>
+  <desc id="desc">Log-scale grouped bar chart comparing live context-buffer allocations for FP16 and Q8 compressed KV at 4096, 65536, and 500000 context tokens.</desc>
+  <style>
+    text { font-family: "Segoe UI", Arial, sans-serif; }
+    .title { font-size: 28px; font-weight: 700; fill: #111827; }
+    .subtitle { font-size: 15px; fill: #4b5563; }
+    .axis { stroke: #334155; stroke-width: 1.4; }
+    .grid { stroke: #e5e7eb; stroke-width: 1; }
+    .tick { font-size: 12px; fill: #64748b; }
+    .label { font-size: 13px; fill: #111827; }
+    .legend { font-size: 13px; font-weight: 600; fill: #111827; }
+    .note { font-size: 12px; fill: #6b7280; }
+  </style>
+  <rect width="1040" height="600" fill="#ffffff"/>
+  <text class="title" x="56" y="50">Compressed KV cache memory impact</text>
+  <text class="subtitle" x="56" y="78">Live context-buffer allocation. Log-scale y-axis keeps small and large context windows readable.</text>
+
+  <rect x="104" y="118" width="816" height="330" fill="#ffffff"/>
+  <line class="axis" x1="104" y1="448" x2="920" y2="448"/>
+  <line class="axis" x1="104" y1="118" x2="104" y2="448"/>
+
+  <g>
+    <line class="grid" x1="104" y1="448.0" x2="920" y2="448.0"/>
+    <line class="grid" x1="104" y1="355.8" x2="920" y2="355.8"/>
+    <line class="grid" x1="104" y1="263.6" x2="920" y2="263.6"/>
+    <line class="grid" x1="104" y1="171.4" x2="920" y2="171.4"/>
+    <line class="grid" x1="104" y1="118.0" x2="920" y2="118.0"/>
+  </g>
+
+  <g class="tick" text-anchor="end">
+    <text x="92" y="452">64 MiB</text>
+    <text x="92" y="359.8">256 MiB</text>
+    <text x="92" y="267.6">1 GiB</text>
+    <text x="92" y="175.4">4 GiB</text>
+    <text x="92" y="122">5 GiB</text>
+  </g>
+  <text class="tick" x="30" y="287" transform="rotate(-90 30 287)" text-anchor="middle">live context buffers, log scale</text>
+
+  <g class="tick" text-anchor="middle">
+    <text x="210" y="476">4,096</text>
+    <text x="510" y="476">65,536</text>
+    <text x="810" y="476">500,000</text>
+    <text x="510" y="505">context frontier</text>
+  </g>
+
+  <g>
+    <rect x="172" y="402.6" width="48" height="45.4" fill="#2563eb"/>
+    <rect x="228" y="417.0" width="48" height="31.0" fill="#16a34a"/>
+
+    <rect x="472" y="294.8" width="48" height="153.2" fill="#2563eb"/>
+    <rect x="528" y="326.0" width="48" height="122.0" fill="#16a34a"/>
+
+    <rect x="772" y="154.5" width="48" height="293.5" fill="#2563eb"/>
+    <rect x="828" y="182.3" width="48" height="265.7" fill="#16a34a"/>
+  </g>
+
+  <g class="label" text-anchor="middle">
+    <rect x="142" y="374" width="108" height="22" rx="4" fill="#ffffff" stroke="#dbeafe"/>
+    <text x="196" y="390" fill="#2563eb">111 MiB</text>
+    <rect x="222" y="386" width="84" height="22" rx="4" fill="#ffffff" stroke="#dcfce7"/>
+    <text x="264" y="402" fill="#16a34a">90 MiB</text>
+
+    <rect x="442" y="267" width="108" height="22" rx="4" fill="#ffffff" stroke="#dbeafe"/>
+    <text x="496" y="283" fill="#2563eb">643 MiB</text>
+    <rect x="510" y="335" width="108" height="22" rx="4" fill="#ffffff" stroke="#dcfce7"/>
+    <text x="564" y="351" fill="#16a34a">471 MiB</text>
+
+    <rect x="736" y="126" width="120" height="22" rx="4" fill="#ffffff" stroke="#dbeafe"/>
+    <text x="796" y="142" fill="#2563eb">4,475 MiB</text>
+    <rect x="802" y="192" width="120" height="22" rx="4" fill="#ffffff" stroke="#dcfce7"/>
+    <text x="862" y="208" fill="#16a34a">3,165 MiB</text>
+  </g>
+
+  <g class="legend">
+    <rect x="716" y="42" width="16" height="16" fill="#2563eb"/>
+    <text x="742" y="55">FP16 KV</text>
+    <rect x="808" y="42" width="16" height="16" fill="#16a34a"/>
+    <text x="834" y="55">Q8 KV</text>
+  </g>
+
+  <text class="note" x="104" y="548">Source: observable stderr logs. At 500K, Q8 saved 1,309.66 MiB of context-buffer allocation and 1,379 MiB peak GPU memory versus FP16.</text>
+</svg>

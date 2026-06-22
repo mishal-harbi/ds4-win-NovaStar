@@ -107,11 +107,14 @@ typedef struct {
     uint32_t ssd_streaming_cache_experts;
     uint64_t ssd_streaming_cache_bytes;
     uint32_t ssd_streaming_preload_experts;
+    uint32_t ram_streaming_cache_experts;
+    uint64_t ram_streaming_cache_bytes;
     uint64_t simulate_used_memory_bytes;
     bool warm_weights;
     bool quality;
     bool ssd_streaming;
     bool ssd_streaming_cold;
+    bool ram_streaming_cache_preload;
     bool inspect_only;
     bool load_slice;
     uint32_t load_layer_start;

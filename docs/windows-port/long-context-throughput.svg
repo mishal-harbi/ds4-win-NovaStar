@@ -1,0 +1,90 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1040" height="600" viewBox="0 0 1040 600" role="img" aria-labelledby="title desc">
+  <title id="title">Completed long-context throughput probes</title>
+  <desc id="desc">Line chart of completed real-prompt prefill throughput for FP16 and Q8 compressed KV cache at 65536, 262144, and 500000 context tokens.</desc>
+  <style>
+    text { font-family: "Segoe UI", Arial, sans-serif; }
+    .title { font-size: 28px; font-weight: 700; fill: #111827; }
+    .subtitle { font-size: 15px; fill: #4b5563; }
+    .axis { stroke: #334155; stroke-width: 1.4; }
+    .grid { stroke: #e5e7eb; stroke-width: 1; }
+    .tick { font-size: 12px; fill: #64748b; }
+    .label { font-size: 13px; fill: #111827; }
+    .legend { font-size: 13px; font-weight: 600; fill: #111827; }
+    .note { font-size: 12px; fill: #6b7280; }
+  </style>
+  <rect width="1040" height="600" fill="#ffffff"/>
+  <text class="title" x="56" y="50">Completed long-context throughput probes</text>
+  <text class="subtitle" x="56" y="78">Filled real prompt tokens followed by 16 generated tokens; 1M remains unconfirmed.</text>
+
+  <rect x="86" y="118" width="834" height="330" fill="#ffffff"/>
+  <line class="axis" x1="86" y1="448" x2="920" y2="448"/>
+  <line class="axis" x1="86" y1="118" x2="86" y2="448"/>
+
+  <g>
+    <line class="grid" x1="86" y1="411.3" x2="920" y2="411.3"/>
+    <line class="grid" x1="86" y1="374.7" x2="920" y2="374.7"/>
+    <line class="grid" x1="86" y1="338.0" x2="920" y2="338.0"/>
+    <line class="grid" x1="86" y1="301.3" x2="920" y2="301.3"/>
+    <line class="grid" x1="86" y1="264.7" x2="920" y2="264.7"/>
+    <line class="grid" x1="86" y1="228.0" x2="920" y2="228.0"/>
+    <line class="grid" x1="86" y1="191.3" x2="920" y2="191.3"/>
+    <line class="grid" x1="86" y1="154.7" x2="920" y2="154.7"/>
+  </g>
+
+  <g class="tick" text-anchor="end">
+    <text x="74" y="452">240</text>
+    <text x="74" y="415.3">250</text>
+    <text x="74" y="378.7">260</text>
+    <text x="74" y="342.0">270</text>
+    <text x="74" y="305.3">280</text>
+    <text x="74" y="268.7">290</text>
+    <text x="74" y="232.0">300</text>
+    <text x="74" y="195.3">310</text>
+    <text x="74" y="158.7">320</text>
+    <text x="74" y="122">330</text>
+  </g>
+  <text class="tick" x="28" y="287" transform="rotate(-90 28 287)" text-anchor="middle">prefill tokens/s</text>
+
+  <g class="tick" text-anchor="middle">
+    <text x="180" y="476">65,536</text>
+    <text x="500" y="476">262,144</text>
+    <text x="820" y="476">500,000</text>
+    <text x="500" y="505">context frontier</text>
+  </g>
+
+  <polyline points="180,151.5 500,146.1 820,387.2" fill="none" stroke="#2563eb" stroke-width="4" stroke-linecap="round" stroke-linejoin="round"/>
+  <polyline points="180,171.5 820,385.7" fill="none" stroke="#16a34a" stroke-width="4" stroke-linecap="round" stroke-linejoin="round"/>
+
+  <g>
+    <circle cx="180" cy="151.5" r="7" fill="#2563eb" stroke="#ffffff" stroke-width="2"/>
+    <circle cx="500" cy="146.1" r="7" fill="#2563eb" stroke="#ffffff" stroke-width="2"/>
+    <circle cx="820" cy="387.2" r="7" fill="#2563eb" stroke="#ffffff" stroke-width="2"/>
+    <circle cx="180" cy="171.5" r="7" fill="#16a34a" stroke="#ffffff" stroke-width="2"/>
+    <circle cx="820" cy="385.7" r="7" fill="#16a34a" stroke="#ffffff" stroke-width="2"/>
+  </g>
+
+  <g class="label">
+    <rect x="112" y="122" width="106" height="22" rx="4" fill="#ffffff" stroke="#dbeafe"/>
+    <text x="121" y="137" fill="#2563eb">FP16 320.87</text>
+    <rect x="112" y="180" width="94" height="22" rx="4" fill="#ffffff" stroke="#dcfce7"/>
+    <text x="121" y="195" fill="#16a34a">Q8 315.44</text>
+
+    <rect x="436" y="116" width="106" height="22" rx="4" fill="#ffffff" stroke="#dbeafe"/>
+    <text x="445" y="131" fill="#2563eb">FP16 322.35</text>
+
+    <rect x="735" y="342" width="106" height="22" rx="4" fill="#ffffff" stroke="#dbeafe"/>
+    <text x="744" y="357" fill="#2563eb">FP16 256.58</text>
+    <rect x="845" y="394" width="84" height="22" rx="4" fill="#ffffff" stroke="#dcfce7"/>
+    <text x="854" y="409" fill="#16a34a">Q8 257.00</text>
+  </g>
+
+  <g class="legend">
+    <rect x="686" y="128" width="214" height="58" rx="6" fill="#ffffff" stroke="#d1d5db"/>
+    <line x1="704" y1="146" x2="744" y2="146" stroke="#2563eb" stroke-width="4"/>
+    <text x="754" y="150">FP16 compressed KV</text>
+    <line x1="704" y1="168" x2="744" y2="168" stroke="#16a34a" stroke-width="4"/>
+    <text x="754" y="172">Q8 compressed KV</text>
+  </g>
+
+  <text class="note" x="86" y="548">Source: completed observable ds4-bench CSV rows. The 262,144 point predates Q8 testing, so only FP16 is plotted there.</text>
+</svg>

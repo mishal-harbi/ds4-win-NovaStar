@@ -1,0 +1,61 @@
+name: Windows CUDA Self-Hosted
+
+on:
+  workflow_dispatch:
+    inputs:
+      model_path:
+        description: "Path to the supported GGUF model on the self-hosted runner"
+        required: false
+        default: ".\\gguf\\DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix.gguf"
+      run_benchmark:
+        description: "Run the full ds4-bench sweep after build and inspect"
+        required: false
+        type: boolean
+        default: false
+
+jobs:
+  windows-cuda-self-hosted:
+    name: Build and optionally benchmark CUDA on self-hosted Windows
+    runs-on: [self-hosted, Windows, X64, CUDA]
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Build native Windows CUDA target
+        shell: pwsh
+        run: powershell -ExecutionPolicy Bypass -File .\windows_build.ps1 -Target cuda
+
+      - name: Verify command help
+        shell: pwsh
+        run: |
+          .\ds4.exe --help
+          .\ds4-bench.exe --help
+
+      - name: Inspect model if present
+        shell: pwsh
+        run: |
+          $model = "${{ inputs.model_path }}"
+          if (Test-Path -LiteralPath $model) {
+            .\ds4.exe --cuda --inspect -m $model
+          } else {
+            Write-Warning "Model path not found on runner; skipping inspect: $model"
+          }
+
+      - name: Run full benchmark if requested
+        if: ${{ inputs.run_benchmark }}
+        shell: pwsh
+        run: |
+          $model = "${{ inputs.model_path }}"
+          if (!(Test-Path -LiteralPath $model)) {
+            throw "Model path not found on runner: $model"
+          }
+          powershell -ExecutionPolicy Bypass -File .\windows_benchmark.ps1 -Model $model
+
+      - name: Upload benchmark artifacts
+        if: ${{ inputs.run_benchmark }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-cuda-benchmark-results
+          path: benchmark-results/
+          if-no-files-found: error

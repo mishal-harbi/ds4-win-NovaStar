@@ -18,9 +18,13 @@
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <stdarg.h>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#if defined(_WIN32)
+#include "ds4_win32.h"
+#endif
 
 typedef struct {
     const char *model_path;
@@ -41,6 +45,8 @@ typedef struct {
     uint32_t ssd_streaming_cache_experts;
     uint64_t ssd_streaming_cache_bytes;
     uint32_t ssd_streaming_preload_experts;
+    uint32_t ram_streaming_cache_experts;
+    uint64_t ram_streaming_cache_bytes;
     uint64_t simulate_used_memory_bytes;
     double step_mul;
     const char *dump_frontier_logits_dir;
@@ -49,12 +55,60 @@ typedef struct {
     bool quality;
     bool ssd_streaming;
     bool ssd_streaming_cold;
+    bool ram_streaming_cache_preload;
 } bench_config;
 
 static double bench_now_sec(void) {
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return (double)ts.tv_sec + (double)ts.tv_nsec / 1000000000.0;
+}
+
+static double g_bench_start_sec;
+
+static void bench_logf(const char *fmt, ...) {
+    const double now = bench_now_sec();
+    const double elapsed = g_bench_start_sec > 0.0 ? now - g_bench_start_sec : 0.0;
+    fprintf(stderr, "ds4-bench: t=%.3fs ", elapsed);
+    va_list ap;
+    va_start(ap, fmt);
+    vfprintf(stderr, fmt, ap);
+    va_end(ap);
+    fputc('\n', stderr);
+    fflush(stderr);
+}
+
+typedef struct {
+    int frontier;
+    int last_current;
+    double start_sec;
+    double last_log_sec;
+} bench_progress;
+
+static void bench_prefill_progress_cb(void *ud, const char *event, int current, int total) {
+    bench_progress *p = ud;
+    if (!p || !event) return;
+    if (strcmp(event, "prefill_chunk") && strcmp(event, "prefill_display")) return;
+
+    const double now = bench_now_sec();
+    const bool first = p->last_current < 0;
+    const bool done = total > 0 && current >= total;
+    const bool advanced_enough = p->last_current < 0 || current - p->last_current >= 16384;
+    const bool waited_enough = p->last_log_sec <= 0.0 || now - p->last_log_sec >= 10.0;
+    if (!first && !done && !advanced_enough && !waited_enough) return;
+
+    const double prefill_elapsed = p->start_sec > 0.0 ? now - p->start_sec : 0.0;
+    const double tps = prefill_elapsed > 0.0 && current > 0 ?
+        (double)current / prefill_elapsed : 0.0;
+    bench_logf("prefill progress event=%s frontier=%d current=%d total=%d elapsed=%.3fs approx_tps=%.2f",
+               event,
+               p->frontier,
+               current,
+               total,
+               prefill_elapsed,
+               tps);
+    p->last_current = current;
+    p->last_log_sec = now;
 }
 
 static void usage(FILE *fp, const char *topic) {
@@ -260,6 +314,19 @@ static bench_config parse_options(int argc, char **argv) {
             }
             c.ssd_streaming_cache_experts = experts;
             c.ssd_streaming_cache_bytes = bytes;
+        } else if (!strcmp(arg, "--ram-streaming-cache-experts")) {
+            uint32_t experts = 0;
+            uint64_t bytes = 0;
+            if (!ds4_parse_streaming_cache_experts_arg(
+                    need_arg(&i, argc, argv, arg), &experts, &bytes)) {
+                fprintf(stderr,
+                        "ds4-bench: --ram-streaming-cache-experts must be a positive count or <number>GB\n");
+                exit(2);
+            }
+            c.ram_streaming_cache_experts = experts;
+            c.ram_streaming_cache_bytes = bytes;
+        } else if (!strcmp(arg, "--ram-streaming-cache-preload")) {
+            c.ram_streaming_cache_preload = true;
         } else if (!strcmp(arg, "--ssd-streaming-preload-experts")) {
             int v = parse_int(need_arg(&i, argc, argv, arg), arg);
             if (v <= 0) {
@@ -506,7 +573,24 @@ static void maybe_warn_distributed_step_shape(const bench_config *cfg, ds4_sessi
 }
 
 int main(int argc, char **argv) {
+#if defined(_WIN32)
+    ds4_win32_enable_utf8_console();
+#endif
     bench_config cfg = parse_options(argc, argv);
+    g_bench_start_sec = bench_now_sec();
+    bench_logf("run start backend=%s model=%s prompt=%s chat_prompt=%s ctx_start=%d ctx_max=%d ctx_alloc=%d step_incr=%d step_mul=%.4g gen_tokens=%d prefill_chunk=%u ssd_streaming=%s",
+               ds4_backend_name(cfg.backend),
+               cfg.model_path,
+               cfg.prompt_path ? cfg.prompt_path : "",
+               cfg.chat_prompt_path ? cfg.chat_prompt_path : "",
+               cfg.ctx_start,
+               cfg.ctx_max,
+               cfg.ctx_alloc,
+               cfg.step_incr,
+               cfg.step_mul,
+               cfg.gen_tokens,
+               cfg.prefill_chunk,
+               cfg.ssd_streaming ? "yes" : "no");
 
     ds4_engine_options opt = {
         .model_path = cfg.model_path,
@@ -516,12 +600,15 @@ int main(int argc, char **argv) {
         .ssd_streaming_cache_experts = cfg.ssd_streaming_cache_experts,
         .ssd_streaming_cache_bytes = cfg.ssd_streaming_cache_bytes,
         .ssd_streaming_preload_experts = cfg.ssd_streaming_preload_experts,
+        .ram_streaming_cache_experts = cfg.ram_streaming_cache_experts,
+        .ram_streaming_cache_bytes = cfg.ram_streaming_cache_bytes,
         .simulate_used_memory_bytes = cfg.simulate_used_memory_bytes,
         .power_percent = cfg.power_percent,
         .warm_weights = cfg.warm_weights,
         .quality = cfg.quality,
         .ssd_streaming = cfg.ssd_streaming,
         .ssd_streaming_cold = cfg.ssd_streaming_cold,
+        .ram_streaming_cache_preload = cfg.ram_streaming_cache_preload,
         .expert_profile_path = cfg.expert_profile_path,
         .distributed = cfg.dist,
     };
@@ -531,17 +618,23 @@ int main(int argc, char **argv) {
         return 2;
     }
     ds4_engine *engine = NULL;
+    bench_logf("engine open start");
     if (ds4_engine_open(&engine, &opt) != 0) return 1;
+    bench_logf("engine open done");
     log_context_memory(cfg.backend, cfg.ctx_alloc, cfg.prefill_chunk);
 
+    bench_logf("prompt read start path=%s", cfg.prompt_path ? cfg.prompt_path : cfg.chat_prompt_path);
     char *text = read_file(cfg.prompt_path ? cfg.prompt_path : cfg.chat_prompt_path);
+    bench_logf("prompt read done bytes=%llu", (unsigned long long)strlen(text));
     ds4_tokens prompt = {0};
+    bench_logf("tokenize start mode=%s", cfg.chat_prompt_path ? "chat" : "plain");
     if (cfg.chat_prompt_path) {
         ds4_encode_chat_prompt(engine, cfg.system, text, DS4_THINK_NONE, &prompt);
     } else {
         ds4_tokenize_text(engine, text, &prompt);
     }
     free(text);
+    bench_logf("tokenize done tokens=%d", prompt.len);
 
     if (prompt.len < cfg.ctx_max) {
         fprintf(stderr,
@@ -554,12 +647,14 @@ int main(int argc, char **argv) {
     }
 
     ds4_session *session = NULL;
+    bench_logf("session create start ctx_alloc=%d", cfg.ctx_alloc);
     if (ds4_session_create(&session, engine, cfg.ctx_alloc) != 0) {
         fprintf(stderr, "ds4-bench: failed to create session\n");
         ds4_tokens_free(&prompt);
         ds4_engine_close(engine);
         return 1;
     }
+    bench_logf("session create done prefill_cap=%d", ds4_session_prefill_cap(session));
     if (cfg.dist.role == DS4_DISTRIBUTED_COORDINATOR &&
         wait_distributed_route(session) != 0)
     {
@@ -592,35 +687,73 @@ int main(int argc, char **argv) {
     int rc = 0;
 
     for (int frontier = cfg.ctx_start; ; frontier = next_frontier(&cfg, frontier)) {
+        const bool final_frontier = frontier >= cfg.ctx_max;
         ds4_tokens prefix = {
             .v = prompt.v,
             .len = frontier,
             .cap = frontier,
         };
 
+        bench_progress progress = {
+            .frontier = frontier,
+            .last_current = -1,
+            .start_sec = bench_now_sec(),
+        };
+        bench_logf("frontier start frontier=%d previous=%d final=%s",
+                   frontier,
+                   previous,
+                   final_frontier ? "yes" : "no");
         const double prefill_t0 = bench_now_sec();
+        ds4_session_set_progress(session, bench_prefill_progress_cb, &progress);
+        ds4_session_set_display_progress(session, bench_prefill_progress_cb, &progress);
         if (ds4_session_sync(session, &prefix, err, sizeof(err)) != 0) {
+            ds4_session_set_progress(session, NULL, NULL);
+            ds4_session_set_display_progress(session, NULL, NULL);
             fprintf(stderr, "ds4-bench: prefill to %d failed: %s\n", frontier, err);
             rc = 1;
             break;
         }
+        ds4_session_set_progress(session, NULL, NULL);
+        ds4_session_set_display_progress(session, NULL, NULL);
         const double prefill_t1 = bench_now_sec();
         const double prefill_sec = prefill_t1 - prefill_t0;
         const int prefill_tokens = frontier - previous;
+        bench_logf("prefill done frontier=%d prefill_tokens=%d elapsed=%.3fs tps=%.2f",
+                   frontier,
+                   prefill_tokens,
+                   prefill_sec,
+                   prefill_sec > 0.0 ? (double)prefill_tokens / prefill_sec : 0.0);
 
         if (write_frontier_logits_json(&cfg, engine, session, frontier, previous) != 0) {
             rc = 1;
             break;
         }
 
-        if (cfg.gen_tokens > 0 && !distributed) {
+        uint64_t kvcache_bytes = distributed ? 0 : ds4_session_payload_bytes(session);
+        const bool need_snapshot = cfg.gen_tokens > 0 && !distributed && !final_frontier;
+        if (need_snapshot) {
+            bench_logf("snapshot start frontier=%d expected_payload_bytes=%llu",
+                       frontier,
+                       (unsigned long long)kvcache_bytes);
+            const double snap_t0 = bench_now_sec();
             if (ds4_session_save_snapshot(session, &snap, err, sizeof(err)) != 0) {
                 fprintf(stderr, "ds4-bench: snapshot at %d failed: %s\n", frontier, err);
                 rc = 1;
                 break;
             }
+            const double snap_t1 = bench_now_sec();
+            kvcache_bytes = snap.len;
+            bench_logf("snapshot done frontier=%d bytes=%llu elapsed=%.3fs",
+                       frontier,
+                       (unsigned long long)snap.len,
+                       snap_t1 - snap_t0);
+        } else if (cfg.gen_tokens > 0 && !distributed) {
+            bench_logf("snapshot skipped frontier=%d reason=final_frontier payload_bytes=%llu",
+                       frontier,
+                       (unsigned long long)kvcache_bytes);
         }
 
+        bench_logf("generation start frontier=%d tokens=%d", frontier, cfg.gen_tokens);
         const double gen_t0 = bench_now_sec();
         for (int i = 0; i < cfg.gen_tokens; i++) {
             if (ds4_session_pos(session) + 1 >= ds4_session_ctx(session)) {
@@ -642,21 +775,36 @@ int main(int argc, char **argv) {
         }
         const double gen_t1 = bench_now_sec();
         if (rc != 0) break;
+        bench_logf("generation done frontier=%d tokens=%d elapsed=%.3fs tps=%.2f",
+                   frontier,
+                   cfg.gen_tokens,
+                   gen_t1 - gen_t0,
+                   gen_t1 > gen_t0 ? (double)cfg.gen_tokens / (gen_t1 - gen_t0) : 0.0);
 
         if (cfg.gen_tokens == 0) {
             /* Pure prefill benchmark: leave the live session at the frontier. */
         } else if (distributed) {
+            bench_logf("distributed replay restore start frontier=%d", frontier);
             if (ds4_session_sync(session, &prefix, err, sizeof(err)) != 0) {
                 fprintf(stderr, "ds4-bench: distributed replay restore at %d failed: %s\n", frontier, err);
                 rc = 1;
                 break;
             }
-        } else {
+            bench_logf("distributed replay restore done frontier=%d", frontier);
+        } else if (need_snapshot) {
+            bench_logf("restore start frontier=%d bytes=%llu",
+                       frontier,
+                       (unsigned long long)snap.len);
+            const double restore_t0 = bench_now_sec();
             if (ds4_session_load_snapshot(session, &snap, err, sizeof(err)) != 0) {
                 fprintf(stderr, "ds4-bench: restore at %d failed: %s\n", frontier, err);
                 rc = 1;
                 break;
             }
+            const double restore_t1 = bench_now_sec();
+            bench_logf("restore done frontier=%d elapsed=%.3fs",
+                       frontier,
+                       restore_t1 - restore_t0);
         }
 
         const double gen_sec = gen_t1 - gen_t0;
@@ -667,13 +815,17 @@ int main(int argc, char **argv) {
                 prefill_sec > 0.0 ? (double)prefill_tokens / prefill_sec : 0.0,
                 cfg.gen_tokens,
                 gen_sec > 0.0 ? (double)cfg.gen_tokens / gen_sec : 0.0,
-                (unsigned long long)(distributed ? 0 : snap.len));
+                (unsigned long long)kvcache_bytes);
         fflush(out);
+        bench_logf("csv row written frontier=%d kvcache_bytes=%llu",
+                   frontier,
+                   (unsigned long long)kvcache_bytes);
 
         previous = frontier;
         if (frontier >= cfg.ctx_max) break;
     }
 
+    bench_logf("run finish rc=%d", rc);
     if (out != stdout) fclose(out);
     ds4_session_snapshot_free(&snap);
     ds4_session_free(session);
