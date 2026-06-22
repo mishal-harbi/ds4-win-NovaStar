@@ -17,7 +17,7 @@ Makefile text eol=lf
 *.txt text eol=lf
 *.json text eol=lf
 *.jsonl text eol=lf
-*.csv text eol=lf
+*.csv text=auto
 *.svg text eol=lf
 
 *.gguf binary
