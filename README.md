@@ -226,8 +226,6 @@ FP16, while prefill throughput stayed effectively the same.
 | 1,000,000        | Not completed         | Allocation was observed, but the run did not fill 1M real prompt tokens.         |
 | 1,048,576        | Allocation smoke only | Short-prompt allocation probe exited; it was not a filled-context run.           |
 
-The strongest public statement supported by the current evidence is:
-
 > This Windows CUDA port ran DeepSeek V4 Flash through a completed 500,000-token
 > real-prompt prefill and generated afterward on a single RTX PRO 6000
 > Blackwell workstation, with both FP16 and Q8 compressed-KV modes tested.
